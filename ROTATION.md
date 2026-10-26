@@ -80,12 +80,14 @@ pkeys rotate --provider commandcode --key-file commandcode-dawid-jgg.md --apply
 ## What `--apply` does
 
 1. Copies `auth.json` and `models.json` to `<file>.bak-pkeys-<UTC timestamp>`.
-2. Writes the new key into **every** slot holding the old one:
-   `auth.json[<provider>].key`, `auth.json.providers[<provider>].apiKey`,
-   `models.json.providers[<provider>].apiKey`. This matters because duplicated
-   keys are common here — `pkeys doctor` currently reports conflicts for both
-   `commandcode` and `nano-gpt` — and rotating one copy while leaving another
-   stale produces the worst failure mode: a working-looking config that 401s.
+2. Writes the new key into every **credential** slot holding the old one:
+   `auth.json[<provider>].key` and `models.json.providers[<provider>].apiKey`.
+   `auth.json.providers[<provider>]` is deliberately not written: pi reads
+   auth.json as a flat providerId → credential map, so that nested block is not
+   a credential and editing it would only preserve junk. Rotating one copy while
+   leaving another stale produces the worst failure mode — a working-looking
+   config that 401s — which is why `pkeys tidy` exists to reduce a provider to
+   one source before you rotate.
 3. Clears the cached validation result for that provider, so the next
    `pkeys status` cannot show a stale "active".
 4. Appends one JSON line to `.rotation-log.jsonl` with from/to fingerprints,
@@ -156,9 +158,12 @@ At the time of writing:
   reading. `opencode-go`, `nano-gpt` and `zai` do report quotas
   (`pkeys limits --live`), which makes them safe to rotate on a *throttle*
   signal rather than only on a hard auth failure.
-- `commandcode` and `nano-gpt` each have their key defined twice in config with
-  different values (`models.json` wins over `auth.json`).
 - Key files are mode `664`, group/world readable.
 - `openai-codex` OAuth token expired 23 days ago.
+
+Resolved since this note was written: both duplicate keys are gone
+(`pkeys tidy --apply`), and the precedence is stated the right way round —
+`auth.json` wins over `models.json`, verified against `pi auth print-api-key`
+before and after the tidy, which returned identical keys both times.
 
 `pkeys doctor` reports all of the above.

@@ -11,8 +11,8 @@ does it cost. Nothing is fetched from the network unless you ask for it with
 $ pkeys
 PROVIDER       AUTH             KEY SOURCE                   MODELS  SUB                      TOKENS  COST    LIMITS                 KEY
 claude         active, 5h left  ~/.claude/.credentials.json  -       active, peak 22%         -       -       quota api              2217cc8e
-commandcode *  active (1h ago)  models.json (conflict)       10      active, peak 12% +1 key  2B      $67.18  quota api              f6371afe
-nano-gpt       active (1h ago)  models.json (conflict)       12      inactive (past_due)      2.3M    $0.06   quota + usage api      e4d1b425
+commandcode *  active (1h ago)  auth.json                    10      active, peak 46% +1 key  2B      $67.18  quota api              97d8e48c
+nano-gpt       active (1h ago)  models.json                  12      inactive (past_due)      2.3M    $0.06   quota + usage api      e4d1b425
 nvidia         active (1h ago)  models.json                  4       no api                   4.5M    $0      none                   01e8d39e
 openai-codex   expired 23d ago  auth.json (oauth)            8       no api                   0       $0      none                   -
 opencode-go    active (1h ago)  auth.json                    28      active, peak 74% +1 key  9.7B    $80.03  quota api              17653b1c
@@ -56,6 +56,7 @@ pkeys models [provider]     configured models, prices, and their usage
 pkeys doctor                config health: bad JSON, duplicate keys, expired tokens
 pkeys check [provider]      validate keys against the provider (--live)
 pkeys rotate --provider X   swap to another key from the key store
+pkeys tidy [provider]       one credential source per provider (--keep, --apply)
 pkeys help [command]        help for pkeys or one command
 ```
 
@@ -137,6 +138,42 @@ Security → Management API tokens) and read
 balance. That would need a key file named `nano-gpt-<label>.md` plus a small
 manual edit to point the adapter at the management path.
 
+## Which key pi actually uses
+
+pi resolves credentials in a fixed order: a runtime `--api-key`, then a stored
+credential in `auth.json`, then an `apiKey` in `models.json`, then the
+environment. `pkeys` reports the winner and marks the rest as a conflict,
+because a losing copy that disagrees is a 401 waiting for the next `/logout`.
+
+Two things this makes visible that a plain `grep` of the config does not:
+
+- **`auth.json` is a flat map of providerId → credential.** A nested
+  `auth.json.providers` block is not a credential, and pi never reads it as one.
+  Importing one as a second key source invents conflicts that do not exist.
+- **`auth.json` beats `models.json`.** If both hold a key and they differ, the
+  `auth.json` one is the key being spent, whatever `models.json` says.
+
+`pkeys tidy` reconciles the two, in either direction:
+
+```
+$ pkeys tidy
+pi resolves a runtime --api-key, then auth.json, then models.json. Keeping: auth.
+
+commandcode
+  drop        models.json[providers.commandcode].apiKey
+  keep        auth.json (97d8e48c)
+  why         two credentials for one provider (ce3fdb46 in models.json)
+nano-gpt
+  drop        auth.json[providers.nano-gpt]
+  keep        models.json (e4d1b425)
+  why         not a credential slot; pi reads auth.json as providerId -> credential
+```
+
+`--keep models` flips the choice for providers you manage through `models.json`;
+`--apply` writes, after copying both files to `<file>.bak-pkeys-<timestamp>`
+and logging the change. Writes preserve the file's existing mode, so `auth.json`
+stays `0600` rather than becoming world-readable under the umask.
+
 ## More than one key for the same provider
 
 Two keys are two quotas. `pkeys limits` asks every key you have, not just the
@@ -196,8 +233,9 @@ once).
 python3 -m unittest discover -s tests -t .
 ```
 
-Eight tests, no network, no keys needed: key-file name matching, lane
-construction, headroom ranking, and a cached multi-key render. Everything they
+Sixteen tests, no network, no keys needed: key-file name matching, lane
+construction, headroom ranking, credential precedence, the tidy plan in both
+directions, write permissions, and a cached multi-key render. Everything they
 touch is loaded from a temporary `PKEYS_HOME`.
 
 ## Rate-limit headers

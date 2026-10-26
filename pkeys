@@ -21,7 +21,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 
 # Exit codes: scripts need to tell "you typed it wrong" from "the network broke".
 EX_OK = 0
@@ -223,8 +223,21 @@ def read_json(path: Path, required: bool = False) -> dict:
 
 
 def write_json(path: Path, data: dict) -> None:
+    """Atomic write that never widens the permissions of a secrets file.
+
+    auth.json holds every provider key on the machine and is normally 0600.
+    A plain write_text would recreate it under the umask (0664) and quietly
+    make it group- and world-readable, so the old mode is carried over.
+    """
     tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(data, indent=2) + "\n")
+    try:
+        mode = path.stat().st_mode & 0o777
+    except OSError:
+        mode = 0o600
+    handle = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+    with os.fdopen(handle, "w") as stream:
+        stream.write(json.dumps(data, indent=2) + "\n")
+    os.chmod(tmp, mode)
     os.replace(tmp, path)
 
 
@@ -473,7 +486,8 @@ def build_providers(cfg: Config) -> dict[str, Provider]:
             providers[name] = Provider(name=name)
         return providers[name]
 
-    # 1. models.json owns provider definitions for custom providers.
+    # 1. models.json owns provider definitions for custom providers. Its apiKey
+    #    is the LAST credential pi falls back to, so it never wins a conflict.
     for name, entry in (cfg.models.get("providers") or {}).items():
         if not isinstance(entry, dict):
             continue
@@ -486,34 +500,18 @@ def build_providers(cfg: Config) -> dict[str, Provider]:
             prov.key = entry["apiKey"]
             prov.key_source = "models.json"
 
-    # 2. auth.json owns credentials.
+    # 2. auth.json owns credentials, and pi resolves them BEFORE models.json.
+    #    Entries are a flat map of providerId -> credential, so anything else in
+    #    the file (a nested "providers" block, for instance) is not a credential
+    #    and is deliberately not read as one here.
     for name, entry in cfg.auth.items():
-        if not isinstance(entry, dict):
+        if not isinstance(entry, dict) or name == "providers":
             continue
-        if name == "providers":
-            for pname, pentry in entry.items():
-                if not isinstance(pentry, dict):
-                    continue
-                prov = ensure(pname)
-                prov.configured = True
-                prov.base_url = prov.base_url or pentry.get("baseUrl")
-                prov.api = prov.api or pentry.get("api")
-                if not prov.models:
-                    prov.models = pentry.get("models") or []
-                key = pentry.get("apiKey")
-                if key:
-                    if prov.key and prov.key != key:
-                        prov.other_key_sources.append(("auth.json/providers", key))
-                    elif not prov.key:
-                        prov.key = key
-                        prov.key_source = "auth.json"
-                    else:
-                        prov.other_key_sources.append(("auth.json/providers", key))
+        auth_type = entry.get("type", "api_key")
+        if auth_type not in ("api_key", "oauth"):
             continue
-
         prov = ensure(name)
         prov.configured = True
-        auth_type = entry.get("type", "api_key")
         prov.auth_type = auth_type
         if auth_type == "oauth":
             if entry.get("expires"):
@@ -521,12 +519,13 @@ def build_providers(cfg: Config) -> dict[str, Provider]:
             prov.key_source = "auth.json (oauth)"
             continue
         key = entry.get("key")
-        if key:
-            if prov.key and prov.key != key:
-                prov.other_key_sources.append(("auth.json", key))
-            elif not prov.key:
-                prov.key = key
-                prov.key_source = "auth.json"
+        if not key:
+            continue
+        if prov.key and prov.key != key:
+            # The higher-precedence source wins; the loser is still reported.
+            prov.other_key_sources.append((prov.key_source, prov.key))
+        prov.key = key
+        prov.key_source = "auth.json"
 
     # 3. models-store.json fills in base URLs for auth-only providers.
     for name, entry in cfg.store.items():
@@ -1805,7 +1804,7 @@ def cmd_doctor(args, style: Style) -> int:
                     "warn",
                     name,
                     f"key defined twice with different values ({prov.key_source} wins, {others} differs)",
-                    "keep one source; stale duplicates cause confusing 401s",
+                    f"pkeys tidy --provider {name} --apply  (drops the losing copy, with a backup)",
                 )
             )
         if prov.auth_type == "oauth" and prov.token_expiry and not prov.name.startswith("claude"):
@@ -2005,9 +2004,6 @@ def cmd_rotate(args, style: Style) -> int:
     if isinstance(auth.get(provider), dict):
         auth[provider]["key"] = chosen.value
         changed.append(f"auth.json[{provider}].key")
-    if isinstance((auth.get("providers") or {}).get(provider), dict):
-        auth["providers"][provider]["apiKey"] = chosen.value
-        changed.append(f"auth.json[providers.{provider}].apiKey")
     if "auth.json" in " ".join(changed):
         write_json(root / "auth.json", auth)
 
@@ -2053,6 +2049,199 @@ def cmd_rotate(args, style: Style) -> int:
     print(style.dim(f"logged   {rotation_log_path()}"))
     print()
     print(style.dim("Verify with: pkeys status --live"))
+    return EX_OK
+
+
+# --------------------------------------------------------------------------
+# tidy: one credential source per provider
+# --------------------------------------------------------------------------
+
+
+@dataclass
+class TidyAction:
+    provider: str
+    kind: str  # drop-models-key | drop-auth-key | drop-orphan-auth-block
+    keep: str
+    drop: str
+    detail: str
+
+
+def plan_tidy(cfg: Config, keep: str = "auth") -> list[TidyAction]:
+    """Find every provider holding more than one credential source.
+
+    pi resolves a runtime --api-key first, then a credential in auth.json, then
+    an apiKey in models.json, then the environment. Anything below the winner is
+    a duplicate that can silently disagree, so it is what gets dropped. An
+    `auth.json.providers` block is not a credential at all: pi reads auth.json as
+    a flat providerId -> credential map, so that block is dead weight.
+    """
+    auth = cfg.auth
+    model_providers = cfg.models.get("providers") or {}
+    orphan_blocks = auth.get("providers") if isinstance(auth.get("providers"), dict) else {}
+
+    names = set(model_providers) | set(orphan_blocks)
+    names |= {name for name, value in auth.items() if isinstance(value, dict) and name != "providers"}
+
+    actions: list[TidyAction] = []
+    for name in sorted(names):
+        cred = auth.get(name)
+        cred = cred if isinstance(cred, dict) and cred.get("type") in ("api_key", "oauth") else None
+        model_key = (model_providers.get(name) or {}).get("apiKey")
+
+        if isinstance(orphan_blocks.get(name), dict):
+            survivor = f"models.json ({fingerprint(model_key)})" if model_key else "nothing in auth.json"
+            actions.append(
+                TidyAction(
+                    provider=name,
+                    kind="drop-orphan-auth-block",
+                    keep=survivor,
+                    drop=f"auth.json[providers.{name}]",
+                    detail="not a credential slot; pi reads auth.json as providerId -> credential",
+                )
+            )
+
+        if not (cred and model_key):
+            continue
+        if cred.get("type") == "oauth":
+            actions.append(
+                TidyAction(
+                    provider=name,
+                    kind="drop-models-key",
+                    keep="auth.json (oauth)",
+                    drop=f"models.json[providers.{name}].apiKey",
+                    detail="an OAuth credential is the one pi uses; the literal key is unused",
+                )
+            )
+            continue
+        cred_fp = fingerprint(cred.get("key"))
+        model_fp = fingerprint(model_key)
+        if keep == "models":
+            actions.append(
+                TidyAction(
+                    provider=name,
+                    kind="drop-auth-key",
+                    keep=f"models.json ({model_fp})",
+                    drop=f"auth.json[{name}]",
+                    detail=f"two credentials for one provider ({cred_fp} in auth.json)",
+                )
+            )
+        else:
+            actions.append(
+                TidyAction(
+                    provider=name,
+                    kind="drop-models-key",
+                    keep=f"auth.json ({cred_fp})",
+                    drop=f"models.json[providers.{name}].apiKey",
+                    detail=f"two credentials for one provider ({model_fp} in models.json)",
+                )
+            )
+    return actions
+
+
+def apply_tidy(actions: list[TidyAction], style: Style) -> list[str]:
+    root = agent_dir()
+    stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    backups = []
+    for filename in ("auth.json", "models.json"):
+        path = root / filename
+        if path.exists():
+            backup = root / f"{filename}.bak-pkeys-{stamp}"
+            shutil.copy2(path, backup)
+            backups.append(backup)
+
+    auth = read_json(root / "auth.json", required=True)
+    models_doc = read_json(root / "models.json")
+    changed = []
+
+    for action in actions:
+        if action.kind == "drop-models-key":
+            entry = (models_doc.get("providers") or {}).get(action.provider)
+            if isinstance(entry, dict) and "apiKey" in entry:
+                del entry["apiKey"]
+                changed.append(f"models.json[providers.{action.provider}].apiKey")
+        elif action.kind == "drop-auth-key":
+            if isinstance(auth.get(action.provider), dict):
+                del auth[action.provider]
+                changed.append(f"auth.json[{action.provider}]")
+        elif action.kind == "drop-orphan-auth-block":
+            blocks = auth.get("providers")
+            if isinstance(blocks, dict) and action.provider in blocks:
+                del blocks[action.provider]
+                changed.append(f"auth.json[providers.{action.provider}]")
+                if not blocks:
+                    del auth["providers"]
+
+    if not changed:
+        raise PkeysError("nothing to write", EX_CONFIG, "The config already matches the plan.")
+
+    write_json(root / "auth.json", auth)
+    write_json(root / "models.json", models_doc)
+
+    entry = {
+        "at": datetime.now(timezone.utc).isoformat(),
+        "action": "tidy",
+        "changed": changed,
+        "backups": [str(b) for b in backups],
+    }
+    with rotation_log_path().open("a") as handle:
+        handle.write(json.dumps(entry) + "\n")
+    os.chmod(rotation_log_path(), 0o600)
+
+    state = load_state()
+    for action in actions:
+        state.setdefault("checks", {}).pop(action.provider, None)
+    save_state(state)
+    return changed
+
+
+def cmd_tidy(args, style: Style) -> int:
+    cfg = load_config()
+    providers = build_providers(cfg)
+    keep = "models" if getattr(args, "keep", None) == "models" else "auth"
+    actions = plan_tidy(cfg, keep)
+
+    if args.provider:
+        if args.provider not in providers:
+            close = difflib.get_close_matches(args.provider, list(providers), n=1)
+            hint = f"Did you mean '{close[0]}'?" if close else "Known providers: " + ", ".join(sorted(providers))
+            raise PkeysError(f"unknown provider '{args.provider}'", EX_USAGE, hint)
+        actions = [action for action in actions if action.provider == args.provider]
+
+    if args.json:
+        print(json.dumps({
+            "keep": keep,
+            "applied": bool(args.apply),
+            "actions": [
+                {"provider": a.provider, "kind": a.kind, "drop": a.drop, "keep": a.keep, "detail": a.detail}
+                for a in actions
+            ],
+        }, indent=2, sort_keys=True))
+        if args.apply and actions:
+            apply_tidy(actions, style)
+        return EX_OK
+
+    if not actions:
+        print(style.green("nothing to tidy") + style.dim("  every provider has one credential source"))
+        return EX_OK
+
+    print(style.dim(f"pi resolves a runtime --api-key, then auth.json, then models.json. Keeping: {keep}."))
+    print()
+    for action in actions:
+        print(f"{action.provider}")
+        print(f"  drop        {action.drop}")
+        print(f"  keep        {action.keep}")
+        print(style.dim(f"  why         {action.detail}"))
+    print()
+
+    if not args.apply:
+        print(style.dim("Dry run. Nothing written."))
+        print(style.dim("Apply with: pkeys tidy --apply"))
+        return EX_OK
+
+    changed = apply_tidy(actions, style)
+    for line in changed:
+        print(style.green("dropped") + f"   {line}")
+    print(style.dim("Verify with: pkeys doctor && pi auth print-api-key --provider <name>"))
     return EX_OK
 
 
@@ -2113,6 +2302,8 @@ Usage:
   pkeys doctor [flags]            config health: bad JSON, duplicate keys, expired tokens
   pkeys check [provider] --live   validate keys against the provider
   pkeys rotate --provider <name>  rotate a key (dry run unless --apply)
+  pkeys tidy [provider] [--keep auth|models] [--apply]
+                                  keep one credential per provider, drop the copies
   pkeys help [command]            this text, or help for one command
 
 Common flags:
@@ -2159,6 +2350,7 @@ COMMAND_SUMMARY = [
     ("doctor", "config health checks"),
     ("check", "validate keys against providers (--live)"),
     ("rotate", "swap to another key from the key store"),
+    ("tidy", "one credential source per provider"),
     ("help", "help for pkeys or a command"),
 ]
 
@@ -2221,6 +2413,27 @@ values; expired OAuth tokens; key-file permissions; and whether the default
 model actually exists under the default provider.
 
 Exit code is 3 when it finds an error, so scripts can gate on it.
+""",
+    "tidy": """pkeys tidy — one credential source per provider
+
+Usage: pkeys tidy [provider] [--keep auth|models] [--apply] [--json]
+
+pi resolves credentials in this order: a runtime --api-key, a credential in
+auth.json, an apiKey in models.json, then the environment. A provider holding
+more than one of those is a duplicate: the losing copy can disagree silently
+and produce 401s after a later /logout or hand edit.
+
+--keep auth    keep the auth.json credential, drop models.json's apiKey (default,
+               because that is the copy pi actually uses)
+--keep models  the other way round, for providers you manage through models.json
+
+Also drops an `auth.json.providers` block for that provider: pi reads auth.json
+as a flat providerId -> credential map, so a nested providers block is not a
+credential and never has been.
+
+Dry run by default. --apply copies auth.json and models.json to
+<file>.bak-pkeys-<timestamp>, writes, and appends a line to {rotation_log_path}.
+Writes keep the file's existing mode, so auth.json stays 0600.
 """,
     "check": """pkeys check — validate keys
 
@@ -2346,6 +2559,11 @@ def build_parser() -> Parser:
     rotate.add_argument("--best", action="store_true", help="pick the key with the most headroom")
     rotate.add_argument("--reason")
 
+    tidy = add("tidy")
+    tidy.add_argument("provider", nargs="?")
+    tidy.add_argument("--keep", choices=("auth", "models"), default="auth")
+    tidy.add_argument("--apply", action="store_true")
+
     help_cmd = add("help")
     help_cmd.add_argument("topic", nargs="?")
 
@@ -2360,6 +2578,7 @@ COMMANDS = {
     "doctor": cmd_doctor,
     "check": cmd_check,
     "rotate": cmd_rotate,
+    "tidy": cmd_tidy,
 }
 
 

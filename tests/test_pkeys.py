@@ -94,6 +94,90 @@ class Ranking(unittest.TestCase):
         self.assertIsNone(pk.best_lane([{"label": "x", "data": {"note": "no api"}}]))
 
 
+class Precedence(unittest.TestCase):
+    """pi resolves auth.json before models.json; pkeys must report the same key."""
+
+    def _cfg(self, auth, models):
+        return pk.Config(auth=auth, models=models, store={}, settings={}, keyfiles=[])
+
+    def test_auth_json_beats_models_json(self):
+        cfg = self._cfg(
+            {"commandcode": {"type": "api_key", "key": "from-auth"}},
+            {"providers": {"commandcode": {"apiKey": "from-models", "baseUrl": "https://x"}}},
+        )
+        prov = pk.build_providers(cfg)["commandcode"]
+        self.assertEqual(prov.key, "from-auth")
+        self.assertEqual(prov.key_source, "auth.json")
+        self.assertTrue(prov.has_conflict)
+        self.assertEqual(prov.other_key_sources, [("models.json", "from-models")])
+
+    def test_nested_auth_providers_block_is_not_a_credential(self):
+        cfg = self._cfg(
+            {"providers": {"nano-gpt": {"apiKey": "junk", "baseUrl": "https://nano"}}},
+            {"providers": {"nano-gpt": {"apiKey": "real"}}},
+        )
+        prov = pk.build_providers(cfg)["nano-gpt"]
+        self.assertEqual(prov.key, "real")
+        self.assertEqual(prov.key_source, "models.json")
+        self.assertFalse(prov.has_conflict)
+
+
+class Tidy(unittest.TestCase):
+    def _plan(self, auth, models, keep="auth"):
+        cfg = pk.Config(auth=auth, models=models, store={}, settings={}, keyfiles=[])
+        return pk.plan_tidy(cfg, keep)
+
+    def test_duplicate_credentials_keep_auth_by_default(self):
+        actions = self._plan(
+            {"commandcode": {"type": "api_key", "key": "from-auth"}},
+            {"providers": {"commandcode": {"apiKey": "from-models"}}},
+        )
+        self.assertEqual([a.kind for a in actions], ["drop-models-key"])
+        self.assertIn("auth.json", actions[0].drop.replace("models.json", "auth.json"))
+
+    def test_keep_models_flips_the_choice(self):
+        actions = self._plan(
+            {"commandcode": {"type": "api_key", "key": "from-auth"}},
+            {"providers": {"commandcode": {"apiKey": "from-models"}}},
+            keep="models",
+        )
+        self.assertEqual([a.kind for a in actions], ["drop-auth-key"])
+        self.assertEqual(actions[0].drop, "auth.json[commandcode]")
+
+    def test_orphan_block_is_dropped_and_oauth_key_is_not_touched(self):
+        actions = self._plan(
+            {
+                "providers": {"nano-gpt": {"apiKey": "junk"}},
+                "opencode-go": {"type": "oauth", "access": "a", "refresh": "r", "expires": 1},
+            },
+            {"providers": {"nano-gpt": {"apiKey": "real"}, "opencode-go": {"apiKey": "unused"}}},
+        )
+        self.assertEqual(
+            [(a.provider, a.kind) for a in actions],
+            [("nano-gpt", "drop-orphan-auth-block"), ("opencode-go", "drop-models-key")],
+        )
+
+    def test_single_source_means_no_actions(self):
+        self.assertEqual(self._plan({"zai": {"type": "api_key", "key": "k"}}, {}), [])
+
+
+class WritePermissions(unittest.TestCase):
+    def test_write_json_keeps_a_private_file_private(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "auth.json"
+            path.write_text("{}")
+            os.chmod(path, 0o600)
+            pk.write_json(path, {"a": 1})
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(json.loads(path.read_text()), {"a": 1})
+
+    def test_write_json_creates_new_files_private(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "state.json"
+            pk.write_json(path, {"a": 1})
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+
+
 class CachedRendering(unittest.TestCase):
     """`pkeys limits` without --live must render multi-key lanes from the cache."""
 
