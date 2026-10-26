@@ -19,8 +19,14 @@ been observed on real failures.
 ```
 
 One key per file, named `<provider>-<label>.<md|txt|key>`. The file name is the
-identity: the provider is the prefix before the first `-`, the label is
-everything after it. Content is the bare key, nothing else.
+identity: the provider is the **longest configured provider name** the file name
+starts with, the label is everything after that dash. Content is the bare key,
+nothing else.
+
+That longest-match rule matters for names that contain dashes:
+`opencode-go-dawid-jgg.md` is `opencode-go` + `dawid-jgg`, not `opencode` +
+`go-dawid-jgg`. Getting it wrong makes rotation silently report "no keys for
+this provider", so it is pinned by `tests/test_pkeys.py` rather than assumed.
 
 ```sh
 printf '%s' 'sk-...' > ~/.secrets/provider-keys/commandcode-<label>.md
@@ -32,9 +38,33 @@ because these files sit next to keys for every provider on the machine.
 
 A new provider needs no code change. Drop a file, and `pkeys status` lists it.
 
+## Every key has its own quota
+
+Two keys are two separate pools, so `pkeys limits --live` asks each of them and
+prints the results lane by lane, the live key starred. Nothing needs configuring:
+any file in the store is a lane.
+
+```
+$ pkeys rotate --provider opencode-go --list
+opencode-go: 2 key(s) in /home/dawid/.secrets/provider-keys
+  opencode-go-dawid-jgg.md    3e93d4ff  monthly 100%
+* opencode-go-jagger-xtrm.md  17653b1c  monthly 84%
+```
+
+The numbers after each fingerprint are the key's *tightest* window, read from
+the last `pkeys limits --live` run. No cache means no number, and `--best`
+refuses to pick on no evidence.
+
 ## Selecting the next key
 
-Default is round-robin over the provider's key files:
+Three ways, in order of what the evidence supports:
+
+- `--best` — the key with the most headroom, by tightest window. This is the
+  one to use when a key is running out.
+- `--key-file <name>` — a specific key, when you know which one you want.
+- neither — round-robin, the default, for routine switching.
+
+Round-robin detail:
 
 1. Find the file whose value equals the key currently in config.
 2. Pick the next file in name order, wrapping.
@@ -42,9 +72,8 @@ Default is round-robin over the provider's key files:
    live key cannot be rotated back to, which is exactly the kind of thing that
    should be printed, not guessed at.
 
-Override with `--key-file <name>` when you want a specific key:
-
 ```sh
+pkeys rotate --provider opencode-go --best                 # choose by headroom
 pkeys rotate --provider commandcode --key-file commandcode-dawid-jgg.md --apply
 ```
 

@@ -21,7 +21,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 
 # Exit codes: scripts need to tell "you typed it wrong" from "the network broke".
 EX_OK = 0
@@ -66,6 +66,10 @@ def cache_path() -> Path:
 
 def state_path() -> Path:
     return home() / ".pkeys-state.json"
+
+
+def user_home() -> Path:
+    return Path(os.environ.get("PKEYS_USER_HOME") or Path.home())
 
 
 def rotation_log_path() -> Path:
@@ -243,8 +247,35 @@ class Keyfile:
         return f"{self.provider}-{self.label}"
 
 
-def load_keyfiles() -> list[Keyfile]:
-    """Key store entries are named <provider>-<label>.<ext>; content is the key."""
+@dataclass
+class Lane:
+    """One credential for one provider: the live key, or a spare in the store.
+
+    A provider is not one quota — it is one quota per key. Two commandcode keys
+    are two independent pools of credits, so both have to be asked.
+    """
+
+    label: str
+    key: str
+    source: str
+    active: bool = False
+
+    @property
+    def fingerprint(self) -> str:
+        return fingerprint(self.key)
+
+    @property
+    def display(self) -> str:
+        return f"{self.label} {self.fingerprint}"
+
+
+def load_keyfiles(known: set[str] | None = None) -> list[Keyfile]:
+    """Key store entries are named <provider>-<label>.<ext>; content is the key.
+
+    The provider is the longest configured provider name the file name starts
+    with, so `opencode-go-dawid.md` belongs to opencode-go, not to `opencode`.
+    Unknown prefixes fall back to splitting on the first dash.
+    """
     root = home()
     if not root.exists():
         return []
@@ -260,13 +291,89 @@ def load_keyfiles() -> list[Keyfile]:
             continue
         if not value:
             continue
-        stem = path.stem
-        if "-" in stem:
-            provider, _, label = stem.partition("-")
-        else:
-            provider, label = stem, "default"
+        provider, label = split_keyfile_stem(path.stem, known)
         out.append(Keyfile(path=path, provider=provider, label=label or "default", value=value))
     return out
+
+
+def split_keyfile_stem(stem: str, known: set[str] | None = None) -> tuple[str, str]:
+    for name in sorted(known or (), key=len, reverse=True):
+        if stem == name:
+            return name, "default"
+        if stem.startswith(name + "-"):
+            return name, stem[len(name) + 1 :] or "default"
+    if "-" in stem:
+        provider, _, label = stem.partition("-")
+        return provider, label or "default"
+    return stem, "default"
+
+
+def provider_names_from_config(auth: dict, models: dict, store: dict) -> set[str]:
+    names = set(KNOWN_BASE_URLS)
+    names |= set((models.get("providers") or {}))
+    names |= {name for name in auth if isinstance(auth.get(name), dict)}
+    names |= {
+        name
+        for name, entry in (auth.get("providers") or {}).items()
+        if isinstance(entry, dict)
+    }
+    names |= set(store)
+    return names
+
+
+CLAUDE_USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
+
+
+def claude_accounts() -> list[dict]:
+    """Claude Code OAuth logins on this machine, one per config directory.
+
+    Claude subscriptions live in the CLI, not in pi: `~/.claude/.credentials.json`
+    for the default account, plus one directory per extra account
+    (`~/.claude-<label>/`) when the CLI is run with CLAUDE_CONFIG_DIR set. Each
+    account is a separate subscription with its own 5-hour and weekly windows,
+    so each becomes its own provider rather than a spare key.
+    """
+    dirs: list[tuple[str, Path]] = []
+    env_dir = os.environ.get("CLAUDE_CONFIG_DIR")
+    if env_dir:
+        dirs.append(("claude", Path(env_dir)))
+    dirs.append(("claude", user_home() / ".claude"))
+    for child in sorted(user_home().glob(".claude-*")):
+        if child.is_dir():
+            dirs.append(("claude-" + child.name[len(".claude-") :], child))
+
+    out = []
+    seen: set[str] = set()
+    for name, directory in dirs:
+        if name in seen:
+            continue
+        path = directory / ".credentials.json"
+        if not path.exists():
+            continue
+        seen.add(name)
+        payload = read_json(path)
+        oauth = payload.get("claudeAiOauth") or {}
+        token = oauth.get("accessToken")
+        if not token:
+            continue
+        out.append(
+            {
+                "name": name,
+                "token": token,
+                "path": path,
+                "expiresAt": (oauth.get("expiresAt") or 0) / 1000.0 or None,
+                "subscriptionType": oauth.get("subscriptionType"),
+                "rateLimitTier": oauth.get("rateLimitTier"),
+            }
+        )
+    return out
+
+
+def claude_profile() -> dict:
+    """Account identity the Claude CLI caches next to its credentials."""
+    payload = read_json(user_home() / ".claude.json")
+    account = payload.get("oauthAccount")
+    return account if isinstance(account, dict) else {}
 
 
 # Providers whose base URL only exists outside models.json (auth-only entries).
@@ -312,6 +419,7 @@ class Provider:
     auth_type: str = "api_key"
     models: list[dict] = field(default_factory=list)
     token_expiry: float | None = None  # epoch seconds
+    plan_hint: str | None = None  # plan name known before any API call
     configured: bool = False  # true when auth.json or models.json mentions it
 
     @property
@@ -353,7 +461,7 @@ def load_config() -> Config:
         models=models if isinstance(models, dict) else {},
         store=store if isinstance(store, dict) else {},
         settings=settings if isinstance(settings, dict) else {},
-        keyfiles=load_keyfiles(),
+        keyfiles=load_keyfiles(provider_names_from_config(auth, models, store)),
     )
 
 
@@ -433,6 +541,20 @@ def build_providers(cfg: Config) -> dict[str, Provider]:
         if not prov.models:
             prov.models = entry.get("models") or []
 
+    # 3b. Claude subscriptions are Claude Code's, not pi's: one provider per login.
+    for account in claude_accounts():
+        prov = ensure(account["name"])
+        prov.configured = True
+        prov.auth_type = "oauth"
+        prov.key = account["token"]
+        prov.key_source = str(account["path"]).replace(str(user_home()), "~")
+        prov.token_expiry = account["expiresAt"]
+        tier = account.get("rateLimitTier") or ""
+        plan = account.get("subscriptionType") or "claude"
+        size = tier.rsplit("_", 1)[-1].replace("x", "×") if tier.endswith("x") else ""
+        prov.plan_hint = f"{plan} {size}".strip()
+        prov.base_url = prov.base_url or "https://api.anthropic.com"
+
     # 4. derived fallbacks.
     for prov in providers.values():
         if not prov.base_url and prov.name in KNOWN_BASE_URLS:
@@ -456,6 +578,28 @@ def build_providers(cfg: Config) -> dict[str, Provider]:
     # models-store.json is a download cache. Providers that exist only there were
     # unconfigured deliberately, so showing them as "no key" would be noise.
     return {name: prov for name, prov in providers.items() if prov.configured}
+
+
+def lanes(cfg: Config, prov: Provider) -> list[Lane]:
+    """Every credential this provider has: the live key, then any spares.
+
+    The live key comes first and is the one pi will actually spend. Spares are
+    read from the key store, so a provider with two keys reports two quotas.
+    """
+    out: list[Lane] = []
+    if prov.key:
+        out.append(Lane(label="live", key=prov.key, source=prov.key_source, active=True))
+    for keyfile in cfg.keyfiles:
+        if keyfile.provider != prov.name:
+            continue
+        same = next((lane for lane in out if lane.fingerprint == fingerprint(keyfile.value)), None)
+        if same is not None:
+            # The live key is also in the store: one lane, named after the file.
+            same.label = keyfile.label
+            same.source = f"keyfile {keyfile.path.name}"
+            continue
+        out.append(Lane(label=keyfile.label, key=keyfile.value, source=f"keyfile {keyfile.path.name}"))
+    return out
 
 
 # --------------------------------------------------------------------------
@@ -596,15 +740,14 @@ def model_month_usage(usage: dict, month: str) -> dict[tuple[str, str], dict]:
 # --------------------------------------------------------------------------
 
 
-def http_json(url: str, key: str, timeout: float = 12.0) -> dict:
-    request = urllib.request.Request(
-        url,
-        headers={
-            "User-Agent": f"{PROG}/{VERSION}",
-            "Authorization": f"Bearer {key}",
-            "Accept": "application/json",
-        },
-    )
+def http_json(url: str, key: str, timeout: float = 12.0, extra_headers: dict | None = None) -> dict:
+    headers = {
+        "User-Agent": f"{PROG}/{VERSION}",
+        "Authorization": f"Bearer {key}",
+        "Accept": "application/json",
+    }
+    headers.update(extra_headers or {})
+    request = urllib.request.Request(url, headers=headers)
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
             return json.loads(response.read())
@@ -675,17 +818,23 @@ def live_usage(prov: Provider, month: str) -> dict | None:
     }
 
 
-def fetch_limits(prov: Provider) -> dict | None:
+def limit_adapter(name: str):
+    """The adapter for a provider, including claude-<label> second accounts."""
+    return LIMIT_ADAPTERS.get(name) or LIMIT_ADAPTERS.get(name.split("-")[0])
+
+
+def fetch_limits(prov: Provider, key: str | None = None) -> dict | None:
     """Subscription state, quotas and balance, where the provider exposes them.
 
     Returns a normalised shape so the display code does not care which provider
     answered:
         {active, state, plan, windows[], quotas[], balance, routing, note, source}
     """
-    adapter = LIMIT_ADAPTERS.get(prov.name)
-    if adapter is None or not prov.key:
+    adapter = limit_adapter(prov.name)
+    key = key or prov.key
+    if adapter is None or not key:
         return None
-    return adapter(prov)
+    return adapter(prov, key)
 
 
 def _iso_epoch_millis(value: str | None) -> float | None:
@@ -697,10 +846,10 @@ def _iso_epoch_millis(value: str | None) -> float | None:
         return None
 
 
-def _limits_opencode(prov: Provider) -> dict:
+def _limits_opencode(prov: Provider, key: str) -> dict:
     """Rolling 5h / weekly / monthly percentage caps with reset times."""
     url = (prov.base_url or "https://opencode.ai/inference/go/v1").rstrip("/") + "/usage"
-    payload = http_json(url, prov.key)
+    payload = http_json(url, key)
     windows = []
     for name, entry in (payload.get("usage") or {}).items():
         if not isinstance(entry, dict):
@@ -718,11 +867,11 @@ def _limits_opencode(prov: Provider) -> dict:
     return {"active": True, "state": "active", "windows": windows, "source": url}
 
 
-def _limits_nanogpt(prov: Provider) -> dict:
+def _limits_nanogpt(prov: Provider, key: str) -> dict:
     """Subscription status, token quotas and USD balance."""
     root = "https://nano-gpt.com"
     url = root + "/api/v1/subscription/usage"
-    payload = http_json(url, prov.key)
+    payload = http_json(url, key)
     quotas = []
     for key, label in (
         ("dailyInputTokens", "daily input tokens"),
@@ -751,7 +900,7 @@ def _limits_nanogpt(prov: Provider) -> dict:
             root + "/api/check-balance",
             data=b"{}",
             method="POST",
-            headers={"User-Agent": f"{PROG}/{VERSION}", "x-api-key": prov.key, "Content-Type": "application/json"},
+            headers={"User-Agent": f"{PROG}/{VERSION}", "x-api-key": key, "Content-Type": "application/json"},
         )
         with urllib.request.urlopen(request, timeout=12) as response:
             balance = json.loads(response.read()).get("usd_balance")
@@ -771,10 +920,10 @@ def _limits_nanogpt(prov: Provider) -> dict:
     }
 
 
-def _limits_zai(prov: Provider) -> dict:
+def _limits_zai(prov: Provider, key: str) -> dict:
     """GLM Coding Plan quota. Keys without a coding plan get a clear answer."""
     url = "https://api.z.ai/api/monitor/usage/quota/limit"
-    payload = http_json(url, prov.key)
+    payload = http_json(url, key)
     if not payload.get("success"):
         message = payload.get("msg") or "quota lookup failed"
         return {
@@ -794,7 +943,7 @@ def _commandcode_slug(plan_id: str | None, plan_name: str | None) -> str:
     return f"{plan_id or ''} {plan_name or ''}".lower()
 
 
-def _limits_commandcode(prov: Provider) -> dict:
+def _limits_commandcode(prov: Provider, key: str) -> dict:
     """Plan credits and the two rolling windows behind `/usage` in the CLI.
 
     One call to /alpha/billing/credits answers everything that matters: the
@@ -804,13 +953,13 @@ def _limits_commandcode(prov: Provider) -> dict:
     status and renewal date.
     """
     url = COMMANDCODE_API + "/alpha/billing/credits"
-    payload = http_json(url, prov.key)
+    payload = http_json(url, key)
     credits = payload.get("credits") or {}
     limits = payload.get("windowLimits") or {}
 
     subscription = {}
     try:
-        subscription = http_json(COMMANDCODE_API + "/alpha/billing/subscriptions", prov.key).get("data") or {}
+        subscription = http_json(COMMANDCODE_API + "/alpha/billing/subscriptions", key).get("data") or {}
     except PkeysError:
         subscription = {}
 
@@ -864,10 +1013,55 @@ def _limits_commandcode(prov: Provider) -> dict:
     }
 
 
+def _limits_claude(prov: Provider, key: str) -> dict:
+    """Claude subscription windows, from the route Claude Code's own UI reads.
+
+    Utilisation arrives already computed by Anthropic, so nothing is inferred
+    from local transcripts. The token is never refreshed here: rotating an OAuth
+    token would break the copy the CLI is holding.
+    """
+    if prov.token_expiry and prov.token_expiry <= time.time():
+        return {
+            "active": False,
+            "state": "expired",
+            "plan": prov.plan_hint,
+            "note": "OAuth token expired — run claude once and it refreshes itself",
+            "source": CLAUDE_USAGE_URL,
+        }
+    payload = http_json(CLAUDE_USAGE_URL, key, extra_headers={"anthropic-beta": "oauth-2025-04-20"})
+    windows = []
+    for field, label in (("five_hour", "rolling 5h"), ("seven_day", "weekly")):
+        entry = payload.get(field) or {}
+        percent = entry.get("utilization")
+        if percent is None:
+            continue
+        windows.append(
+            {
+                "name": label,
+                "status": "exceeded" if (entry.get("locked_reason") or percent >= 100) else "ok",
+                "percent": percent,
+                "resetsAt": _iso_epoch_millis(entry.get("resets_at")),
+            }
+        )
+    extra = payload.get("extra_usage") or {}
+    balance = None
+    if extra.get("is_enabled") and extra.get("monthly_limit") and extra.get("used_credits") is not None:
+        balance = float(extra["monthly_limit"]) - float(extra["used_credits"])
+    return {
+        "active": True,
+        "state": "active",
+        "plan": prov.plan_hint,
+        "windows": windows,
+        "balance": balance,
+        "source": CLAUDE_USAGE_URL,
+    }
+
+
 # Providers with a real limits surface. Everything absent here has no public
 # route: they keep usage in a web UI and send no quota or credit headers on
 # inference responses, so nothing can be read from the API.
 LIMIT_ADAPTERS = {
+    "claude": _limits_claude,
     "commandcode": _limits_commandcode,
     "opencode-go": _limits_opencode,
     "nano-gpt": _limits_nanogpt,
@@ -898,22 +1092,25 @@ def save_state(state: dict) -> None:
 def sub_state(prov: Provider, state: dict, style: Style) -> str:
     """Subscription status from the last --live run, with its age."""
     cached = (state.get("limits") or {}).get(prov.name)
-    if prov.name not in LIMIT_ADAPTERS:
+    if limit_adapter(prov.name) is None:
         return style.dim("no api")
     if not cached:
         return style.dim("unknown")
     data = cached.get("data") or {}
     age = human_age(time.time() - (cached.get("fetchedAt") or 0))
+    if data.get("note"):
+        return style.dim("unknown")
     state_name = (data.get("state") or "unknown").lower()
     active = data.get("active")
     if active is False or state_name in ("inactive", "past_due", "canceled"):
         detail = data.get("providerStatus") or state_name
         return style.yellow(f"inactive ({detail})")
-    if data.get("note"):
-        return style.dim("unknown")
+    spares = max(len(cached.get("lanes") or []) - 1, 0)
+    suffix = style.dim(f" +{spares} key{'s' if spares > 1 else ''}") if spares else ""
     if data.get("windows"):
         peak = max((w.get("percent") or 0) for w in data["windows"])
-        return style.green(f"active, peak {peak:.0f}%") if peak < 90 else style.yellow(f"active, peak {peak:.0f}%")
+        text = f"active, peak {peak:.0f}%"
+        return (style.green(text) if peak < 90 else style.yellow(text)) + suffix
     if active is True:
         return style.green(f"active ({age})")
     return style.dim("unknown")
@@ -943,7 +1140,7 @@ def limit_state(prov: Provider, live: dict | None) -> str:
     window = (live or {}).get("window") or {}
     if window.get("from") and window.get("to"):
         return f"usage {window['from']}..{window['to']}"
-    has_quota = prov.name in LIMIT_ADAPTERS
+    has_quota = limit_adapter(prov.name) is not None
     has_usage = prov.name in USAGE_ENDPOINTS
     if has_quota and has_usage:
         return "quota + usage api"
@@ -996,7 +1193,7 @@ def cmd_status(args, style: Style) -> int:
                     "checkedAt": time.time(),
                     "detail": exc.message,
                 }
-            if prov.name in LIMIT_ADAPTERS:
+            if limit_adapter(prov.name) is not None:
                 try:
                     fetched = fetch_limits(prov)
                     if fetched:
@@ -1248,6 +1445,83 @@ def bar(percent: float | None, width: int = 20) -> str:
     return marks + suffix
 
 
+def _worst_window(data: dict | None) -> tuple[float, str] | None:
+    """The window closest to its cap: how much room a lane really has left."""
+    peaks = []
+    for window in (data or {}).get("windows") or []:
+        percent = window.get("percent")
+        if percent is not None:
+            peaks.append((float(percent), str(window.get("name"))))
+    for quota in (data or {}).get("quotas") or []:
+        percent = quota.get("percent")
+        if percent is not None:
+            peaks.append((float(percent), str(quota.get("name"))))
+    if not peaks:
+        return None
+    return max(peaks)
+
+
+def best_lane(lane_rows: list[dict]) -> dict | None:
+    """The credential with the most headroom, among the lanes that answered."""
+    usable = []
+    for lane in lane_rows:
+        peak = _worst_window(lane.get("data"))
+        if peak is not None:
+            usable.append((peak[0], lane))
+    if not usable:
+        return None
+    return min(usable, key=lambda item: item[0])[1]
+
+
+def _print_limits_block(data: dict, style: Style, indent: str = "  ") -> None:
+    if data.get("note"):
+        print(f"{indent}status      {style.yellow(data['note'])}")
+    elif data.get("state"):
+        state_name = data["state"]
+        detail = data.get("providerStatus")
+        text = state_name + (f" ({detail})" if detail and detail != state_name else "")
+        coloured = style.green(text) if data.get("active") else style.yellow(text) if data.get("active") is False else text
+        print(f"{indent}status      {coloured}")
+    if data.get("plan"):
+        print(f"{indent}{'plan':<20}{data['plan']}")
+    for window in data.get("windows") or []:
+        window_name = str(window.get("name"))
+        status = window.get("status")
+        if status and status != "ok":
+            window_name += f" {style.red(status)}"
+        if len(window_name) >= 14:
+            window_name += " "
+        reset = window.get("resetsAt")
+        line = f"{indent}{window_name:<14}{bar(window.get('percent'))}"
+        if window.get("used") is not None and window.get("cap"):
+            line += f"   {human_money(window['used'])} of {human_money(window['cap'])}"
+        if reset:
+            line += style.dim(f"   resets in {human_duration(reset - time.time())}")
+        print(line)
+    for quota in data.get("quotas") or []:
+        used = quota.get("used")
+        remaining = quota.get("remaining")
+        parts = [f"{indent}{str(quota.get('name')):<20}{bar(quota.get('percent'))}"]
+        if used is not None and remaining is not None:
+            parts.append(f"{human_int(used)} used, {human_int(remaining)} left")
+        elif remaining is not None:
+            parts.append(f"{human_int(remaining)} allowance")
+        reset = quota.get("resetsAt")
+        if reset:
+            parts.append(f"resets in {human_duration(reset - time.time())}")
+        print("   ".join(parts))
+    if data.get("balance") is not None:
+        try:
+            print(f"{indent}{'balance':<20}{human_money(float(data['balance']))} USD")
+        except (TypeError, ValueError):
+            print(f"{indent}{'balance':<20}{data['balance']} USD")
+    routing = data.get("routing") or {}
+    if routing.get("recommendedMode"):
+        print(style.dim(f"{indent}routing           {routing['recommendedMode']} — {routing.get('reason') or ''}"))
+    if data.get("source"):
+        print(style.dim(f"{indent}source            {data['source']}"))
+
+
 def cmd_limits(args, style: Style) -> int:
     cfg = load_config()
     providers = build_providers(cfg)
@@ -1259,25 +1533,40 @@ def cmd_limits(args, style: Style) -> int:
         hint = f"Did you mean '{close[0]}'?" if close else "Known providers: " + ", ".join(sorted(providers))
         raise PkeysError(f"unknown provider '{args.provider}'", EX_USAGE, hint)
 
-    results = {}
+    results: dict[str, dict | None] = {}
+    lane_rows: dict[str, list[dict]] = {}
     failures = 0
+
+    for name in selected:
+        prov = providers[name]
+        cached = (state.get("limits") or {}).get(name) or {}
+        if args.live and limit_adapter(prov.name) is not None and prov.key:
+            rows = []
+            for lane in lanes(cfg, prov):
+                entry = {"label": lane.label, "fingerprint": lane.fingerprint, "active": lane.active, "source": lane.source}
+                try:
+                    entry["data"] = fetch_limits(prov, lane.key)
+                    entry["fetchedAt"] = time.time()
+                except PkeysError as exc:
+                    entry["data"] = {"state": "unknown", "note": exc.message, "source": None}
+                    entry["fetchedAt"] = time.time()
+                    failures += 1
+                rows.append(entry)
+            active_row = next((row for row in rows if row["active"]), rows[0] if rows else None)
+            state.setdefault("limits", {})[name] = {
+                "fetchedAt": time.time(),
+                "data": (active_row or {}).get("data"),
+                "lanes": rows,
+            }
+            cached = state["limits"][name]
+        elif args.live:
+            rows = []
+        else:
+            rows = cached.get("lanes") or []
+        lane_rows[name] = rows
+        results[name] = cached.get("data")
     if args.live:
-        for name in selected:
-            prov = providers[name]
-            if prov.name not in LIMIT_ADAPTERS or not prov.key:
-                results[name] = (state.get("limits") or {}).get(name, {}).get("data")
-                continue
-            try:
-                data = fetch_limits(prov)
-                state.setdefault("limits", {})[name] = {"fetchedAt": time.time(), "data": data}
-                results[name] = data
-            except PkeysError as exc:
-                results[name] = {"state": "unknown", "note": exc.message, "source": None}
-                failures += 1
         save_state(state)
-    else:
-        for name in selected:
-            results[name] = (state.get("limits") or {}).get(name, {}).get("data")
 
     if args.json:
         payload = {}
@@ -1285,37 +1574,52 @@ def cmd_limits(args, style: Style) -> int:
             cached = (state.get("limits") or {}).get(name) or {}
             payload[name] = {
                 "fetchedAt": cached.get("fetchedAt"),
-                "supportsApi": name in LIMIT_ADAPTERS,
+                "supportsApi": limit_adapter(name) is not None,
                 "data": results.get(name),
+                "lanes": [
+                    {
+                        "label": row.get("label"),
+                        "fingerprint": row.get("fingerprint"),
+                        "active": row.get("active"),
+                        "source": row.get("source"),
+                        "fetchedAt": row.get("fetchedAt"),
+                        "data": row.get("data"),
+                    }
+                    for row in lane_rows.get(name) or []
+                ],
             }
         print(json.dumps(payload, indent=2, sort_keys=True))
         return EX_NETWORK if failures else EX_OK
 
     if args.plain:
-        print("provider\tkind\tname\tpercent\tused\tlimit\tremaining\tresets_at\tbalance")
+        print("provider\tkind\tname\tpercent\tused\tlimit\tremaining\tresets_at\tbalance\tlane\tactive")
         for name in selected:
-            data = results.get(name) or {}
-            balance = data.get("balance")
-            stamp = _iso(data.get("periodEnd"))
-            if data.get("windows"):
-                for window in data["windows"]:
-                    print("\t".join([
-                        name, "window", str(window.get("name")), f"{window.get('percent') or 0:.0f}",
-                        str(window.get("used") if window.get("used") is not None else ""),
-                        str(window.get("cap") if window.get("cap") is not None else ""),
-                        "", _iso(window.get("resetsAt")), balance or "",
-                    ]))
-            elif data.get("quotas"):
-                for quota in data["quotas"]:
-                    print("\t".join([
-                        name, "quota", str(quota.get("name")), f"{(quota.get('percent') or 0):.0f}",
-                        str(quota.get("used") if quota.get("used") is not None else ""),
-                        "", str(quota.get("remaining") if quota.get("remaining") is not None else ""),
-                        _iso(quota.get("resetsAt")), balance or "",
-                    ]))
-            else:
-                reason = data.get("note") or ("no api" if name not in LIMIT_ADAPTERS else "unknown")
-                print("\t".join([name, "none", reason, "", "", "", "", stamp, balance or ""]))
+            rows = lane_rows.get(name) or [{"label": "live", "fingerprint": "", "active": True, "data": results.get(name)}]
+            for row in rows:
+                data = row.get("data") or {}
+                balance = data.get("balance")
+                stamp = _iso(data.get("periodEnd"))
+                lane = row.get("label") or ""
+                active = "1" if row.get("active") else "0"
+                if data.get("windows"):
+                    for window in data["windows"]:
+                        print("\t".join([
+                            name, "window", str(window.get("name")), f"{window.get('percent') or 0:.0f}",
+                            str(window.get("used") if window.get("used") is not None else ""),
+                            str(window.get("cap") if window.get("cap") is not None else ""),
+                            "", _iso(window.get("resetsAt")), balance or "", lane, active,
+                        ]))
+                elif data.get("quotas"):
+                    for quota in data["quotas"]:
+                        print("\t".join([
+                            name, "quota", str(quota.get("name")), f"{(quota.get('percent') or 0):.0f}",
+                            str(quota.get("used") if quota.get("used") is not None else ""),
+                            "", str(quota.get("remaining") if quota.get("remaining") is not None else ""),
+                            _iso(quota.get("resetsAt")), balance or "", lane, active,
+                        ]))
+                else:
+                    reason = data.get("note") or ("no api" if limit_adapter(name) is None else "unknown")
+                    print("\t".join([name, "none", reason, "", "", "", "", stamp, balance or "", lane, active]))
         return EX_NETWORK if failures else EX_OK
 
     if not args.live:
@@ -1323,69 +1627,54 @@ def cmd_limits(args, style: Style) -> int:
         print()
 
     for name in selected:
-        data = results.get(name)
         cached = (state.get("limits") or {}).get(name) or {}
         title = style.bold(name)
         if name == cfg.default_provider:
             title += style.dim(" (default)")
-        if name not in LIMIT_ADAPTERS:
+        rows = lane_rows.get(name) or []
+        spare_count = max(len(rows) - 1, 0)
+        if limit_adapter(name) is None:
             print(f"{title}  {style.dim('no limits API')}")
             print(style.dim("  no public route exposes plan or quota for this provider"))
             print()
             continue
-        if not data:
+        data = results.get(name)
+        if not data and not rows:
             print(f"{title}  {style.dim('never fetched')}")
             print(style.dim(f"  pkeys limits {name} --live"))
             print()
             continue
 
         when = cached.get("fetchedAt")
-        print(f"{title}  {style.dim(human_age(time.time() - when) if when else 'unknown age')}")
+        heading = style.dim(human_age(time.time() - when) if when else "unknown age")
+        if spare_count:
+            heading += style.dim(f"  {len(rows)} keys")
+        print(f"{title}  {heading}")
 
-        if data.get("note"):
-            print(f"  status      {style.yellow(data['note'])}")
-        elif data.get("state"):
-            state_name = data["state"]
-            detail = data.get("providerStatus")
-            text = state_name + (f" ({detail})" if detail and detail != state_name else "")
-            coloured = style.green(text) if data.get("active") else style.yellow(text) if data.get("active") is False else text
-            print(f"  status      {coloured}")
-        if data.get("plan"):
-            print(f"  {'plan':<20}{data['plan']}")
-        for window in data.get("windows") or []:
-            window_name = str(window.get("name"))
-            status = window.get("status")
-            if status and status != "ok":
-                window_name += f" {style.red(status)}"
-            reset = window.get("resetsAt")
-            line = f"  {window_name:<14}{bar(window.get('percent'))}"
-            if window.get("used") is not None and window.get("cap"):
-                line += f"   {human_money(window['used'])} of {human_money(window['cap'])}"
-            if reset:
-                line += style.dim(f"   resets in {human_duration(reset - time.time())}")
-            print(line)
-        for quota in data.get("quotas") or []:
-            used = quota.get("used")
-            remaining = quota.get("remaining")
-            parts = [f"  {str(quota.get('name')):<20}{bar(quota.get('percent'))}"]
-            if used is not None and remaining is not None:
-                parts.append(f"{human_int(used)} used, {human_int(remaining)} left")
-            elif remaining is not None:
-                parts.append(f"{human_int(remaining)} allowance")
-            reset = quota.get("resetsAt")
-            if reset:
-                parts.append(f"resets in {human_duration(reset - time.time())}")
-            print("   ".join(parts))
-        if data.get("balance") is not None:
-            try:
-                print(f"  {'balance':<20}{human_money(float(data['balance']))} USD")
-            except (TypeError, ValueError):
-                print(f"  {'balance':<20}{data['balance']} USD")
-        routing = data.get("routing") or {}
-        if routing.get("recommendedMode"):
-            print(style.dim(f"  routing           {routing['recommendedMode']} — {routing.get('reason') or ''}"))
-        if data.get("source"):
-            print(style.dim(f"  source            {data['source']}"))
+        if len(rows) <= 1:
+            _print_limits_block(data or (rows[0].get("data") if rows else {}) or {}, style)
+        else:
+            for row in rows:
+                marker = style.green("*") if row.get("active") else " "
+                label = f"{row.get('label')} {row.get('fingerprint')}"
+                stamp = row.get("fetchedAt")
+                age = style.dim(human_age(time.time() - stamp)) if stamp else ""
+                print(f"  {marker} {label}{'  ' + age if age else ''}")
+                _print_limits_block(row.get("data") or {}, style, indent="      ")
+            pick = best_lane(rows)
+            current = next((row for row in rows if row.get("active")), None)
+            if pick is not None and pick is current:
+                peak = _worst_window(pick.get("data"))
+                if peak is not None and peak[0] >= 75:
+                    print(f"  {style.yellow('no spare is better')}  live key is at {peak[0]:.0f}% of {peak[1]}")
+            if pick is not None and pick is not current:
+                peak = _worst_window(pick.get("data"))
+                current_peak = _worst_window(current.get("data")) if current else None
+                advice = f"{pick.get('label')} {pick.get('fingerprint')}  {peak[1]} {peak[0]:.0f}%"
+                if current_peak:
+                    advice += style.dim(f"   live key is at {current_peak[0]:.0f}%")
+                print(f"  {style.dim('most headroom')}  {advice}")
+                print(style.dim(f"  rotate to it:  pkeys rotate --provider {name} --best --apply"))
         print()
 
     return EX_NETWORK if failures else EX_OK
@@ -1519,7 +1808,7 @@ def cmd_doctor(args, style: Style) -> int:
                     "keep one source; stale duplicates cause confusing 401s",
                 )
             )
-        if prov.auth_type == "oauth" and prov.token_expiry:
+        if prov.auth_type == "oauth" and prov.token_expiry and not prov.name.startswith("claude"):
             remaining = prov.token_expiry - time.time()
             if remaining <= 0:
                 problems.append(
@@ -1621,11 +1910,17 @@ def cmd_rotate(args, style: Style) -> int:
     candidates = keyfile_candidates(cfg, provider)
     active = active_keyfile(cfg, prov)
 
+    cached_lanes = ((load_state().get("limits") or {}).get(provider) or {}).get("lanes") or []
+    by_fingerprint = {row.get("fingerprint"): row for row in cached_lanes}
+
     if args.list:
         print(f"{provider}: {len(candidates)} key(s) in {home()}")
         for keyfile in candidates:
             marker = style.green("* ") if active and keyfile.path == active.path else "  "
-            print(f"{marker}{keyfile.path.name}  {fingerprint(keyfile.value)}")
+            row = by_fingerprint.get(fingerprint(keyfile.value)) or {}
+            peak = _worst_window(row.get("data"))
+            headroom = style.dim(f"  {peak[1]} {peak[0]:.0f}%") if peak else style.dim("  no limits on record")
+            print(f"{marker}{keyfile.path.name}  {fingerprint(keyfile.value)}{headroom}")
         if not candidates:
             print(style.dim(f"  none — add one as {provider}-<label>.md"))
         elif active is None:
@@ -1649,6 +1944,21 @@ def cmd_rotate(args, style: Style) -> int:
         if not chosen:
             value = target.read_text().strip()
             chosen = Keyfile(path=target, provider=provider, label=target.stem, value=value)
+    elif args.best:
+        ranked = []
+        for keyfile in candidates:
+            row = by_fingerprint.get(fingerprint(keyfile.value)) or {}
+            peak = _worst_window(row.get("data"))
+            if peak is None:
+                continue
+            ranked.append((peak[0], keyfile))
+        if not ranked:
+            raise PkeysError(
+                f"no headroom numbers for '{provider}'",
+                EX_CONFIG,
+                f"Run: pkeys limits {provider} --live",
+            )
+        chosen = min(ranked, key=lambda item: item[0])[1]
     else:
         # round-robin: next candidate after the active one, wrapping
         order = candidates
@@ -1869,8 +2179,14 @@ Usage: pkeys limits [provider] [--live] [--json|--plain]
 
 Reads each provider's own limits endpoint:
   opencode-go  GET /inference/go/v1/usage — rolling 5h, weekly, monthly percent
+  commandcode  GET /alpha/billing/credits — plan credits, 5h and weekly windows
+  claude       GET /api/oauth/usage — subscription 5h and weekly utilisation
   nano-gpt     GET /api/v1/subscription/usage and POST /api/check-balance
   zai          GET /api/monitor/usage/quota/limit (GLM Coding Plan only)
+
+A provider with more than one key is reported lane by lane, because each key
+has its own quota: the live key is starred, spares follow, and the key with
+the most headroom is named when it is not the live one.
 
 Without --live this prints the values from the last fetch, with their age.
 Providers with no public limits route are marked 'no api' rather than guessed at.
@@ -1921,10 +2237,16 @@ Usage:
   pkeys rotate --provider <name> [--dry-run]
   pkeys rotate --provider <name> --apply [--key-file <file>] [--reason TEXT]
   pkeys rotate --provider <name> --list
+  pkeys rotate --provider <name> --best --apply
 
-Keys live in {home}, named <provider>-<label>.md, one key per file.
+Keys live in {home}, named <provider>-<label>.md, one key per file. The
+provider is the longest provider name the file name starts with, so
+opencode-go-<label>.md belongs to opencode-go.
+
 Without --key-file, rotation picks the next file after the active key,
-wrapping around (round-robin).
+wrapping around (round-robin). With --best it picks the key with the most
+headroom from the last `pkeys limits --live` run, which is what you want when
+one key is running out: --list shows each key's tightest window.
 
 Default is a dry run: prints the planned swap and writes nothing.
 With --apply it backs up auth.json and models.json to
@@ -2021,6 +2343,7 @@ def build_parser() -> Parser:
     rotate.add_argument("--apply", action="store_true")
     rotate.add_argument("--dry-run", action="store_true")
     rotate.add_argument("--list", action="store_true")
+    rotate.add_argument("--best", action="store_true", help="pick the key with the most headroom")
     rotate.add_argument("--reason")
 
     help_cmd = add("help")

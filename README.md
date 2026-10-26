@@ -9,12 +9,13 @@ does it cost. Nothing is fetched from the network unless you ask for it with
 
 ```
 $ pkeys
-PROVIDER       AUTH             KEY SOURCE              MODELS  SUB                  TOKENS  COST    LIMITS                 KEY
-commandcode *  active (1h ago)  models.json (conflict)  10      active, peak 12%     2B      $67.18  quota api              f6371afe
-nano-gpt       active (1h ago)  models.json (conflict)  12      inactive (past_due)  2.3M    $0.06   quota + usage api      e4d1b425
-nvidia         active (1h ago)  models.json             4       no api               4.5M    $0      none                   01e8d39e
-openai-codex   expired 23d ago  auth.json (oauth)       8       no api               0       $0      none                   -
-opencode-go    active (1h ago)  auth.json               28      active, peak 74%     9.7B    $80.03  quota api              17653b1c
+PROVIDER       AUTH             KEY SOURCE                   MODELS  SUB                      TOKENS  COST    LIMITS                 KEY
+claude         active, 5h left  ~/.claude/.credentials.json  -       active, peak 22%         -       -       quota api              2217cc8e
+commandcode *  active (1h ago)  models.json (conflict)       10      active, peak 12% +1 key  2B      $67.18  quota api              f6371afe
+nano-gpt       active (1h ago)  models.json (conflict)       12      inactive (past_due)      2.3M    $0.06   quota + usage api      e4d1b425
+nvidia         active (1h ago)  models.json                  4       no api                   4.5M    $0      none                   01e8d39e
+openai-codex   expired 23d ago  auth.json (oauth)            8       no api                   0       $0      none                   -
+opencode-go    active (1h ago)  auth.json                    28      active, peak 74% +1 key  9.7B    $80.03  quota api              17653b1c
 ```
 
 ## Install
@@ -101,6 +102,7 @@ There *is* an API for this on most of your providers. `pkeys limits` reads them.
 | `zai` | `GET /api/monitor/usage/quota/limit` | GLM Coding Plan windows — returns "no coding plan" for a plain API key |
 | `commandcode` | `GET /alpha/billing/credits` | plan credit pool plus the 5-hour and weekly windows, already reduced to `used` / `cap` / `resetAt` by the provider |
 | `commandcode` | `GET /alpha/billing/subscriptions` | `status`, `planId` (`individual-goat`), current period start/end, `cancelAtPeriodEnd` |
+| `claude` | `GET /api/oauth/usage` | subscription `five_hour` / `seven_day` utilisation and reset times, `extra_usage` (needs `anthropic-beta: oauth-2025-04-20`) |
 | `nvidia`, `typesafe`, `openai-codex` | — | no public per-account quota route |
 
 `pkeys limits` without `--live` prints the last fetched values with their age;
@@ -135,6 +137,69 @@ Security → Management API tokens) and read
 balance. That would need a key file named `nano-gpt-<label>.md` plus a small
 manual edit to point the adapter at the management path.
 
+## More than one key for the same provider
+
+Two keys are two quotas. `pkeys limits` asks every key you have, not just the
+one pi is spending, and prints them lane by lane with the live key starred:
+
+```
+$ pkeys limits commandcode --live
+commandcode (default)  just now  2 keys
+  * dawid-jgg ce3fdb46  just now
+      rolling 5h    ....................   0.0%   $0.0000 of $14.00   resets in 1h
+      weekly        ....................   0.0%   $0.0000 of $35.00   resets in 6d
+    jagger-xtrm 97d8e48c  just now
+      rolling 5h    #...................   1.5%   $0.21 of $14.00   resets in 2h
+      weekly        #########...........  45.9%   $16.07 of $35.00   resets in 3d
+```
+
+When the live key is not the roomiest one, the command names the key that is
+and the command that would switch to it. `pkeys status` marks the provider with
+`+1 key` so a spare is never invisible.
+
+Selection ranks keys by their *tightest* window (a key with 90% of its month
+left but 100% of its 5-hour window has no headroom right now):
+
+```sh
+pkeys limits --live                              # refresh every key's windows
+pkeys rotate --provider opencode-go --list       # each key with its tightest window
+pkeys rotate --provider opencode-go --best       # preview switching to the roomiest
+pkeys rotate --provider opencode-go --best --apply
+```
+
+`--best` refuses to guess: with no cached limits it tells you to run
+`pkeys limits --live` first. If the live key is already the best one, rotation
+has nothing to do and says so.
+
+Key file names are matched against the longest provider name they start with,
+so `opencode-go-dawid-jgg.md` belongs to `opencode-go` (not to an `opencode`
+provider that does not exist).
+
+## Claude subscriptions
+
+Claude plan usage lives in the Claude Code CLI, not in pi, so it is read from
+the CLI's own credentials: `~/.claude/.credentials.json`, plus one
+`~/.claude-<label>/` directory per extra account (that is what
+`CLAUDE_CONFIG_DIR` points at). Each account becomes its own provider with its
+own 5-hour and weekly windows, because two subscriptions are two separate
+limits, not two keys of one.
+
+The numbers come from Anthropic's own utilisation endpoint — the same figures
+the CLI's `/usage` shows — so nothing is inferred from transcripts. The token is
+never refreshed by pkeys: rotating an OAuth token would break the copy the CLI
+is holding. An expired token is reported as such, with the fix (run `claude`
+once).
+
+## Tests
+
+```sh
+python3 -m unittest discover -s tests -t .
+```
+
+Eight tests, no network, no keys needed: key-file name matching, lane
+construction, headroom ranking, and a cached multi-key render. Everything they
+touch is loaded from a temporary `PKEYS_HOME`.
+
 ## Rate-limit headers
 
 Checked, and absent on error responses: neither `commandcode` nor `nano-gpt` nor
@@ -149,4 +214,5 @@ See [ROTATION.md](ROTATION.md). Short version: drop keys in
 ```sh
 pkeys rotate --provider commandcode            # preview, writes nothing
 pkeys rotate --provider commandcode --apply    # swap, with backups and an audit line
+pkeys rotate --provider commandcode --best     # pick the key with the most headroom
 ```
