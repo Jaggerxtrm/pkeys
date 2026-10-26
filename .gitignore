@@ -1,0 +1,7 @@
+# pkeys writes nothing here at runtime, but never commit a stray one.
+.pkeys-cache.json
+.pkeys-state.json
+.rotation-log.jsonl
+
+__pycache__/
+*.pyc

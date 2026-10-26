@@ -1,0 +1,2101 @@
+#!/usr/bin/env python3
+"""pkeys — provider key and usage dashboard for pi.
+
+Reads local config and session logs only. Network calls happen only when you
+pass --live, and only for the specific command you ran.
+"""
+
+from __future__ import annotations
+
+import argparse
+import difflib
+import hashlib
+import json
+import os
+import shutil
+import sys
+import time
+import urllib.error
+import urllib.request
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+
+VERSION = "0.2.0"
+
+# Exit codes: scripts need to tell "you typed it wrong" from "the network broke".
+EX_OK = 0
+EX_ERROR = 1
+EX_USAGE = 2
+EX_CONFIG = 3
+EX_NETWORK = 4
+
+PROG = "pkeys"
+
+
+class PkeysError(Exception):
+    """An error already written for a human, carrying its own exit code."""
+
+    def __init__(self, message: str, code: int = EX_ERROR, hint: str | None = None):
+        super().__init__(message)
+        self.message = message
+        self.code = code
+        self.hint = hint
+
+
+# --------------------------------------------------------------------------
+# paths
+# --------------------------------------------------------------------------
+
+
+def home() -> Path:
+    return Path(os.environ.get("PKEYS_HOME") or (Path.home() / ".secrets" / "provider-keys"))
+
+
+def agent_dir() -> Path:
+    return Path(os.environ.get("PKEYS_AGENT_DIR") or (Path.home() / ".pi" / "agent"))
+
+
+def sessions_dir() -> Path:
+    return Path(os.environ.get("PKEYS_SESSIONS_DIR") or (agent_dir() / "sessions"))
+
+
+def cache_path() -> Path:
+    return home() / ".pkeys-cache.json"
+
+
+def state_path() -> Path:
+    return home() / ".pkeys-state.json"
+
+
+def rotation_log_path() -> Path:
+    return home() / ".rotation-log.jsonl"
+
+
+# --------------------------------------------------------------------------
+# output
+# --------------------------------------------------------------------------
+
+
+class Style:
+    """Colour only when a human is watching, and when they have not opted out."""
+
+    def __init__(self, enabled: bool):
+        self.enabled = enabled
+
+    def _wrap(self, code: str, text: str) -> str:
+        return f"\033[{code}m{text}\033[0m" if self.enabled else text
+
+    def dim(self, t: str) -> str:
+        return self._wrap("2", t)
+
+    def bold(self, t: str) -> str:
+        return self._wrap("1", t)
+
+    def green(self, t: str) -> str:
+        return self._wrap("32", t)
+
+    def yellow(self, t: str) -> str:
+        return self._wrap("33", t)
+
+    def red(self, t: str) -> str:
+        return self._wrap("31", t)
+
+
+def color_enabled(no_color_flag: bool) -> bool:
+    if no_color_flag or os.environ.get("NO_COLOR"):
+        return False
+    if os.environ.get("FORCE_COLOR"):
+        return True
+    return sys.stdout.isatty()
+
+
+def human_int(n: float | int | None) -> str:
+    if n is None:
+        return "-"
+    n = float(n)
+    for limit, suffix in ((1e9, "B"), (1e6, "M"), (1e3, "k")):
+        if abs(n) >= limit:
+            value = n / limit
+            text = f"{value:.1f}" if value < 10 else f"{value:.0f}"
+            return f"{text.rstrip('.0')}{suffix}"
+    return f"{n:.0f}"
+
+
+def human_money(n: float | None) -> str:
+    if n is None:
+        return "-"
+    if n == 0:
+        return "$0"
+    if n < 0.01:
+        return f"${n:.4f}"
+    return f"${n:,.2f}"
+
+
+def human_age(seconds: float) -> str:
+    if seconds < 90:
+        return "just now"
+    if seconds < 5400:
+        return f"{int(seconds // 60)}m ago"
+    if seconds < 172800:
+        return f"{int(seconds // 3600)}h ago"
+    return f"{int(seconds // 86400)}d ago"
+
+
+def human_duration(seconds: float) -> str:
+    seconds = abs(seconds)
+    if seconds < 3600:
+        return f"{int(seconds // 60)}m"
+    if seconds < 172800:
+        return f"{int(seconds // 3600)}h"
+    return f"{int(seconds // 86400)}d"
+
+
+def render_table(headers: list[str], rows: list[list[str]], style: Style) -> str:
+    """Aligned columns, no box borders — scanner-friendly."""
+    # Cells arrive pre-styled, so measure them without ANSI codes.
+    widths = [len(h) for h in headers]
+    for row in rows:
+        for i, cell in enumerate(row):
+            widths[i] = max(widths[i], len(_strip_ansi(cell)))
+    out = []
+    head = "  ".join(style.dim(h.ljust(widths[i])) for i, h in enumerate(headers))
+    out.append(head.rstrip())
+    for row in rows:
+        cells = []
+        for i, cell in enumerate(row):
+            pad = widths[i] - len(_strip_ansi(cell))
+            cells.append(cell + " " * max(0, pad))
+        out.append("  ".join(cells).rstrip())
+    return "\n".join(out)
+
+
+def _strip_ansi(text: str) -> str:
+    out = []
+    i = 0
+    while i < len(text):
+        if text[i] == "\033":
+            while i < len(text) and text[i] != "m":
+                i += 1
+            i += 1
+            continue
+        out.append(text[i])
+        i += 1
+    return "".join(out)
+
+
+def error(message: str, hint: str | None = None) -> None:
+    print(f"{PROG}: error: {message}", file=sys.stderr)
+    if hint:
+        print(f"  {hint}", file=sys.stderr)
+
+
+def note(message: str) -> None:
+    print(message, file=sys.stderr)
+
+
+# --------------------------------------------------------------------------
+# config loading
+# --------------------------------------------------------------------------
+
+
+def read_json(path: Path, required: bool = False) -> dict:
+    if not path.exists():
+        if required:
+            raise PkeysError(
+                f"{path} does not exist",
+                EX_CONFIG,
+                "pi writes this file; run pi once, or point PKEYS_AGENT_DIR at your agent dir.",
+            )
+        return {}
+    try:
+        return json.loads(path.read_text())
+    except json.JSONDecodeError as exc:
+        raise PkeysError(
+            f"{path} is not valid JSON (line {exc.lineno}, column {exc.colno}: {exc.msg})",
+            EX_CONFIG,
+            f"Fix the syntax there, or restore a backup: ls {path.parent}/*.bak-*",
+        )
+
+
+def write_json(path: Path, data: dict) -> None:
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(data, indent=2) + "\n")
+    os.replace(tmp, path)
+
+
+def fingerprint(key: str | None) -> str:
+    """Short, non-reversible id so you can tell keys apart without printing them."""
+    if not key:
+        return "-"
+    return hashlib.sha256(key.encode()).hexdigest()[:8]
+
+
+@dataclass
+class Keyfile:
+    path: Path
+    provider: str
+    label: str
+    value: str
+
+    @property
+    def display(self) -> str:
+        return f"{self.provider}-{self.label}"
+
+
+def load_keyfiles() -> list[Keyfile]:
+    """Key store entries are named <provider>-<label>.<ext>; content is the key."""
+    root = home()
+    if not root.exists():
+        return []
+    out = []
+    for path in sorted(root.iterdir()):
+        if not path.is_file() or path.name.startswith("."):
+            continue
+        if path.suffix.lower() not in {".md", ".txt", ".key", ""}:
+            continue
+        try:
+            value = path.read_text().strip()
+        except OSError:
+            continue
+        if not value:
+            continue
+        stem = path.stem
+        if "-" in stem:
+            provider, _, label = stem.partition("-")
+        else:
+            provider, label = stem, "default"
+        out.append(Keyfile(path=path, provider=provider, label=label or "default", value=value))
+    return out
+
+
+# Providers whose base URL only exists outside models.json (auth-only entries).
+KNOWN_BASE_URLS = {
+    "zai": "https://api.z.ai/api/coding/paas/v4",
+    "typesafe": "https://api.typesafe.ai/v1",
+    "opencode-go": "https://opencode.ai/inference/go/v1",
+    "openrouter": "https://openrouter.ai/api/v1",
+    "nano-gpt": "https://nano-gpt.com/api/v1",
+}
+
+# Endpoints that actually report metered usage. Only these are called with --live.
+USAGE_ENDPOINTS = {
+    "nano-gpt": "/usage",
+}
+
+# commandcode serves plan credits and the rolling windows from the same alpha
+# endpoints its own CLI reads for /usage. The docs never list them; the CLI
+# bundle names them (/alpha/billing/credits, /alpha/billing/subscriptions,
+# /alpha/whoami, /alpha/usage/summary) and the pi key authenticates all of them.
+COMMANDCODE_API = "https://api.commandcode.ai"
+
+# Documented caps, used only when the API hands back a cap of 0 (a plan it does
+# not model). https://commandcode.ai/docs/resources/usage-limits
+COMMANDCODE_PLAN_CAPS = {
+    "go": (10, 2, 5),
+    "goat": (70, 14, 35),
+    "pro": (80, 16, 40),
+    "max20": (300, 90, 180),
+    "max": (150, 45, 90),
+    "team": (40, 12, 24),
+}
+
+
+@dataclass
+class Provider:
+    name: str
+    base_url: str | None = None
+    api: str | None = None
+    key: str | None = None
+    key_source: str = "-"
+    other_key_sources: list[tuple[str, str]] = field(default_factory=list)
+    auth_type: str = "api_key"
+    models: list[dict] = field(default_factory=list)
+    token_expiry: float | None = None  # epoch seconds
+    configured: bool = False  # true when auth.json or models.json mentions it
+
+    @property
+    def fingerprint(self) -> str:
+        return fingerprint(self.key)
+
+    @property
+    def has_conflict(self) -> bool:
+        return any(value != self.key for _, value in self.other_key_sources)
+
+
+@dataclass
+class Config:
+    auth: dict
+    models: dict
+    store: dict
+    settings: dict
+    keyfiles: list[Keyfile]
+
+    @property
+    def default_provider(self) -> str:
+        return self.settings.get("defaultProvider") or ""
+
+    @property
+    def default_model(self) -> str:
+        return self.settings.get("defaultModel") or ""
+
+
+def load_config() -> Config:
+    root = agent_dir()
+    auth = read_json(root / "auth.json", required=True)
+    models = read_json(root / "models.json")
+    store = read_json(root / "models-store.json")
+    settings = read_json(root / "settings.json")
+    if not isinstance(auth, dict):
+        raise PkeysError(f"{root / 'auth.json'} does not contain a JSON object", EX_CONFIG)
+    return Config(
+        auth=auth,
+        models=models if isinstance(models, dict) else {},
+        store=store if isinstance(store, dict) else {},
+        settings=settings if isinstance(settings, dict) else {},
+        keyfiles=load_keyfiles(),
+    )
+
+
+def build_providers(cfg: Config) -> dict[str, Provider]:
+    providers: dict[str, Provider] = {}
+
+    def ensure(name: str) -> Provider:
+        if name not in providers:
+            providers[name] = Provider(name=name)
+        return providers[name]
+
+    # 1. models.json owns provider definitions for custom providers.
+    for name, entry in (cfg.models.get("providers") or {}).items():
+        if not isinstance(entry, dict):
+            continue
+        prov = ensure(name)
+        prov.configured = True
+        prov.base_url = entry.get("baseUrl")
+        prov.api = entry.get("api")
+        prov.models = entry.get("models") or []
+        if entry.get("apiKey"):
+            prov.key = entry["apiKey"]
+            prov.key_source = "models.json"
+
+    # 2. auth.json owns credentials.
+    for name, entry in cfg.auth.items():
+        if not isinstance(entry, dict):
+            continue
+        if name == "providers":
+            for pname, pentry in entry.items():
+                if not isinstance(pentry, dict):
+                    continue
+                prov = ensure(pname)
+                prov.configured = True
+                prov.base_url = prov.base_url or pentry.get("baseUrl")
+                prov.api = prov.api or pentry.get("api")
+                if not prov.models:
+                    prov.models = pentry.get("models") or []
+                key = pentry.get("apiKey")
+                if key:
+                    if prov.key and prov.key != key:
+                        prov.other_key_sources.append(("auth.json/providers", key))
+                    elif not prov.key:
+                        prov.key = key
+                        prov.key_source = "auth.json"
+                    else:
+                        prov.other_key_sources.append(("auth.json/providers", key))
+            continue
+
+        prov = ensure(name)
+        prov.configured = True
+        auth_type = entry.get("type", "api_key")
+        prov.auth_type = auth_type
+        if auth_type == "oauth":
+            if entry.get("expires"):
+                prov.token_expiry = float(entry["expires"]) / 1000.0
+            prov.key_source = "auth.json (oauth)"
+            continue
+        key = entry.get("key")
+        if key:
+            if prov.key and prov.key != key:
+                prov.other_key_sources.append(("auth.json", key))
+            elif not prov.key:
+                prov.key = key
+                prov.key_source = "auth.json"
+
+    # 3. models-store.json fills in base URLs for auth-only providers.
+    for name, entry in cfg.store.items():
+        if not isinstance(entry, dict):
+            continue
+        prov = ensure(name)
+        if not prov.base_url:
+            for model in entry.get("models") or []:
+                if model.get("baseUrl"):
+                    prov.base_url = model["baseUrl"]
+                    break
+        if not prov.models:
+            prov.models = entry.get("models") or []
+
+    # 4. derived fallbacks.
+    for prov in providers.values():
+        if not prov.base_url and prov.name in KNOWN_BASE_URLS:
+            prov.base_url = KNOWN_BASE_URLS[prov.name]
+        if not prov.key:
+            candidates = [k for k in cfg.keyfiles if k.provider == prov.name]
+            if candidates:
+                prov.key = candidates[0].value
+                prov.key_source = f"keyfile {candidates[0].path.name}"
+                for extra in candidates[1:]:
+                    prov.other_key_sources.append((f"keyfile {extra.path.name}", extra.value))
+
+    # 5. keyfiles for providers we do not know about yet.
+    for keyfile in cfg.keyfiles:
+        if keyfile.provider in providers:
+            continue
+        prov = ensure(keyfile.provider)
+        prov.key = keyfile.value
+        prov.key_source = f"keyfile {keyfile.path.name}"
+
+    # models-store.json is a download cache. Providers that exist only there were
+    # unconfigured deliberately, so showing them as "no key" would be noise.
+    return {name: prov for name, prov in providers.items() if prov.configured}
+
+
+# --------------------------------------------------------------------------
+# usage from local session logs
+# --------------------------------------------------------------------------
+
+
+def current_month() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m")
+
+
+def load_cache() -> dict:
+    try:
+        return json.loads(cache_path().read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def save_cache(cache: dict) -> None:
+    try:
+        home().mkdir(parents=True, exist_ok=True)
+        write_json(cache_path(), cache)
+    except OSError:
+        pass
+
+
+def scan_sessions(use_cache: bool = True, quiet: bool = False) -> dict:
+    """Aggregate assistant usage per (month, provider, model).
+
+    Cached per file on (mtime, size) so repeat runs are instant.
+    """
+    root = sessions_dir()
+    if not root.exists():
+        return {}
+    files = sorted(root.rglob("*.jsonl"))
+    cache = load_cache() if use_cache else {}
+    fresh: dict[str, dict] = {}
+    scanned = 0
+    show_progress = not quiet and sys.stderr.isatty() and len(files) > 25
+
+    for index, path in enumerate(files, 1):
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+        entry = cache.get(str(path))
+        if entry and entry.get("mtime") == stat.st_mtime and entry.get("size") == stat.st_size:
+            fresh[str(path)] = entry
+            continue
+
+        buckets: dict[str, list[float]] = {}
+        try:
+            with path.open("r", errors="replace") as handle:
+                for line in handle:
+                    if '"usage"' not in line:
+                        continue
+                    try:
+                        record = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if record.get("type") != "message":
+                        continue
+                    message = record.get("message") or {}
+                    if message.get("role") != "assistant":
+                        continue
+                    usage = message.get("usage") or {}
+                    provider = message.get("provider") or "unknown"
+                    model = message.get("model") or "unknown"
+                    month = str(record.get("timestamp", ""))[:7] or "unknown"
+                    cost = (usage.get("cost") or {}).get("total")
+                    bucket = buckets.setdefault(f"{month}\t{provider}\t{model}", [0, 0, 0, 0, 0, 0])
+                    bucket[0] += 1  # requests
+                    bucket[1] += usage.get("input") or 0
+                    bucket[2] += usage.get("output") or 0
+                    bucket[3] += usage.get("cacheRead") or 0
+                    bucket[4] += usage.get("cacheWrite") or 0
+                    bucket[5] += cost if isinstance(cost, (int, float)) else 0
+        except OSError:
+            continue
+
+        fresh[str(path)] = {"mtime": stat.st_mtime, "size": stat.st_size, "buckets": buckets}
+        scanned += 1
+        if show_progress and index % 50 == 0:
+            print(f"\r  scanning session logs... {index}/{len(files)}", end="", file=sys.stderr)
+
+    if show_progress and scanned:
+        print("\r" + " " * 50 + "\r", end="", file=sys.stderr)
+
+    if use_cache and scanned:
+        save_cache(fresh)
+    elif use_cache:
+        save_cache(fresh)
+
+    totals: dict[tuple[str, str, str], dict] = {}
+    for entry in fresh.values():
+        for key, values in (entry.get("buckets") or {}).items():
+            month, provider, model = key.split("\t", 2)
+            agg = totals.setdefault(
+                (month, provider, model),
+                {"requests": 0, "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "cost": 0.0},
+            )
+            agg["requests"] += values[0]
+            agg["input"] += values[1]
+            agg["output"] += values[2]
+            agg["cacheRead"] += values[3]
+            agg["cacheWrite"] += values[4]
+            agg["cost"] += values[5]
+    for agg in totals.values():
+        agg["totalTokens"] = agg["input"] + agg["output"] + agg["cacheRead"] + agg["cacheWrite"]
+    return totals
+
+
+def provider_month_totals(usage: dict, month: str) -> dict[str, dict]:
+    out: dict[str, dict] = {}
+    for (m, provider, _model), agg in usage.items():
+        if m != month:
+            continue
+        slot = out.setdefault(
+            provider,
+            {"requests": 0, "totalTokens": 0, "cost": 0.0, "models": {}},
+        )
+        slot["requests"] += agg["requests"]
+        slot["totalTokens"] += agg["totalTokens"]
+        slot["cost"] += agg["cost"]
+    for (m, provider, model), agg in usage.items():
+        if m != month:
+            continue
+        out[provider]["models"][model] = agg
+    return out
+
+
+def model_month_usage(usage: dict, month: str) -> dict[tuple[str, str], dict]:
+    return {(p, model): agg for (m, p, model), agg in usage.items() if m == month}
+
+
+# --------------------------------------------------------------------------
+# live adapters — only ever called with --live
+# --------------------------------------------------------------------------
+
+
+def http_json(url: str, key: str, timeout: float = 12.0) -> dict:
+    request = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": f"{PROG}/{VERSION}",
+            "Authorization": f"Bearer {key}",
+            "Accept": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return json.loads(response.read())
+    except urllib.error.HTTPError as exc:
+        if exc.code in (401, 403):
+            raise PkeysError(
+                f"{url} rejected the key (HTTP {exc.code})",
+                EX_NETWORK,
+                "The key is invalid or revoked — rotate it: pkeys rotate --provider <name> --apply",
+            )
+        if exc.code == 404:
+            raise PkeysError(f"{url} has no such endpoint (HTTP 404)", EX_NETWORK)
+        raise PkeysError(f"{url} returned HTTP {exc.code}", EX_NETWORK)
+    except urllib.error.URLError as exc:
+        raise PkeysError(f"cannot reach {url}: {exc.reason}", EX_NETWORK, "Check your network or VPN.")
+    except (TimeoutError, json.JSONDecodeError) as exc:
+        raise PkeysError(f"{url} did not answer usefully: {exc}", EX_NETWORK)
+
+
+def live_validate(prov: Provider) -> dict:
+    """Cheapest possible authenticated call: list models."""
+    if prov.auth_type == "oauth":
+        if prov.token_expiry and prov.token_expiry <= time.time():
+            return {"state": "expired", "detail": "OAuth token expired — re-authenticate in pi"}
+        detail = "OAuth token not exercised over the network"
+        if prov.token_expiry:
+            detail += f", expires in {human_duration(prov.token_expiry - time.time())}"
+        return {"state": "oauth", "detail": detail}
+    if not prov.key:
+        return {"state": "no-key"}
+    if not prov.base_url:
+        return {"state": "unknown", "detail": "no base URL on record"}
+    path = "/models"
+    if prov.name == "nano-gpt":
+        path = "/models"
+    payload = http_json(prov.base_url.rstrip("/") + path, prov.key)
+    models = payload.get("data") or payload.get("models") or []
+    return {"state": "active", "models": len(models), "checkedAt": time.time()}
+
+
+def live_usage(prov: Provider, month: str) -> dict | None:
+    """Provider-reported metered usage, where the provider exposes it."""
+    if prov.name not in USAGE_ENDPOINTS or not prov.key or not prov.base_url:
+        return None
+    url = prov.base_url.rstrip("/") + USAGE_ENDPOINTS[prov.name]
+    payload = http_json(url, prov.key)
+    totals = payload.get("totals") or {}
+    models = []
+    for entry in payload.get("byModel") or []:
+        models.append(
+            {
+                "model": entry.get("model"),
+                "requests": entry.get("requests"),
+                "tokens": entry.get("totalTokens"),
+                "cost": entry.get("costUsd"),
+            }
+        )
+    return {
+        "window": {"from": payload.get("from"), "to": payload.get("to")},
+        "asOf": payload.get("asOf"),
+        "requests": totals.get("requests"),
+        "totalTokens": totals.get("totalTokens"),
+        "input": totals.get("inputTokens"),
+        "output": totals.get("outputTokens"),
+        "cacheRead": totals.get("cacheReadInputTokens"),
+        "cost": totals.get("costUsd"),
+        "models": sorted(models, key=lambda m: m.get("tokens") or 0, reverse=True),
+    }
+
+
+def fetch_limits(prov: Provider) -> dict | None:
+    """Subscription state, quotas and balance, where the provider exposes them.
+
+    Returns a normalised shape so the display code does not care which provider
+    answered:
+        {active, state, plan, windows[], quotas[], balance, routing, note, source}
+    """
+    adapter = LIMIT_ADAPTERS.get(prov.name)
+    if adapter is None or not prov.key:
+        return None
+    return adapter(prov)
+
+
+def _iso_epoch_millis(value: str | None) -> float | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+def _limits_opencode(prov: Provider) -> dict:
+    """Rolling 5h / weekly / monthly percentage caps with reset times."""
+    url = (prov.base_url or "https://opencode.ai/inference/go/v1").rstrip("/") + "/usage"
+    payload = http_json(url, prov.key)
+    windows = []
+    for name, entry in (payload.get("usage") or {}).items():
+        if not isinstance(entry, dict):
+            continue
+        windows.append(
+            {
+                "name": {"rolling": "rolling 5h", "weekly": "weekly", "monthly": "monthly"}.get(name, name),
+                "status": entry.get("status"),
+                "percent": entry.get("percent"),
+                "resetsAt": _iso_epoch_millis(entry.get("resetsAt")),
+            }
+        )
+    order = {"rolling 5h": 0, "weekly": 1, "monthly": 2}
+    windows.sort(key=lambda w: order.get(w["name"], 9))
+    return {"active": True, "state": "active", "windows": windows, "source": url}
+
+
+def _limits_nanogpt(prov: Provider) -> dict:
+    """Subscription status, token quotas and USD balance."""
+    root = "https://nano-gpt.com"
+    url = root + "/api/v1/subscription/usage"
+    payload = http_json(url, prov.key)
+    quotas = []
+    for key, label in (
+        ("dailyInputTokens", "daily input tokens"),
+        ("weeklyInputTokens", "weekly input tokens"),
+        ("dailyImages", "daily images"),
+    ):
+        entry = payload.get(key)
+        if isinstance(entry, dict):
+            quotas.append(
+                {
+                    "name": label,
+                    "used": entry.get("used"),
+                    "remaining": entry.get("remaining"),
+                    "percent": (entry.get("percentUsed") or 0) * 100,
+                    "resetsAt": (entry.get("resetAt") or 0) / 1000.0 if entry.get("resetAt") else None,
+                }
+            )
+    limits = payload.get("limits") or {}
+    for key, label in (("dailyInputTokens", "daily input tokens"), ("weeklyInputTokens", "weekly input tokens")):
+        if limits.get(key) and not any(q["name"] == label for q in quotas):
+            quotas.append({"name": label, "used": None, "remaining": limits[key], "percent": 0, "resetsAt": None})
+
+    balance = None
+    try:
+        request = urllib.request.Request(
+            root + "/api/check-balance",
+            data=b"{}",
+            method="POST",
+            headers={"User-Agent": f"{PROG}/{VERSION}", "x-api-key": prov.key, "Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(request, timeout=12) as response:
+            balance = json.loads(response.read()).get("usd_balance")
+    except Exception:
+        balance = None
+
+    routing = payload.get("routing") or {}
+    return {
+        "active": payload.get("active"),
+        "state": payload.get("state") or ("active" if payload.get("active") else "inactive"),
+        "providerStatus": payload.get("providerStatus"),
+        "quotas": quotas,
+        "balance": balance,
+        "routing": {k: routing.get(k) for k in ("recommendedMode", "reason")},
+        "periodEnd": _iso_epoch_millis((payload.get("period") or {}).get("currentPeriodEnd")),
+        "source": url,
+    }
+
+
+def _limits_zai(prov: Provider) -> dict:
+    """GLM Coding Plan quota. Keys without a coding plan get a clear answer."""
+    url = "https://api.z.ai/api/monitor/usage/quota/limit"
+    payload = http_json(url, prov.key)
+    if not payload.get("success"):
+        message = payload.get("msg") or "quota lookup failed"
+        return {
+            "active": None,
+            "state": "unknown",
+            "note": "no GLM Coding Plan on this key" if "coding plan" in message else message,
+            "source": url,
+        }
+    windows = []
+    for entry in (payload.get("data") or {}).get("limits") or []:
+        if isinstance(entry, dict):
+            windows.append(entry)
+    return {"active": True, "state": "active", "windows": windows, "source": url, "raw": payload.get("data")}
+
+
+def _commandcode_slug(plan_id: str | None, plan_name: str | None) -> str:
+    return f"{plan_id or ''} {plan_name or ''}".lower()
+
+
+def _limits_commandcode(prov: Provider) -> dict:
+    """Plan credits and the two rolling windows behind `/usage` in the CLI.
+
+    One call to /alpha/billing/credits answers everything that matters: the
+    monthly credit pool, and the 5-hour and weekly windows already reduced to
+    used / cap / resetAt by the provider (no local arithmetic over request
+    logs). /alpha/billing/subscriptions is a second call for the plan id,
+    status and renewal date.
+    """
+    url = COMMANDCODE_API + "/alpha/billing/credits"
+    payload = http_json(url, prov.key)
+    credits = payload.get("credits") or {}
+    limits = payload.get("windowLimits") or {}
+
+    subscription = {}
+    try:
+        subscription = http_json(COMMANDCODE_API + "/alpha/billing/subscriptions", prov.key).get("data") or {}
+    except PkeysError:
+        subscription = {}
+
+    plan_id = subscription.get("planId")
+    slug = _commandcode_slug(plan_id, subscription.get("planName"))
+    monthly, five_hour_cap, weekly_cap = None, None, None
+    for key, caps in COMMANDCODE_PLAN_CAPS.items():
+        if key in slug:
+            monthly, five_hour_cap, weekly_cap = caps
+            break
+    pool = credits.get("monthlyCredits") or monthly
+
+    windows = []
+    for label, entry, fallback in (
+        ("rolling 5h", limits.get("fiveHour") or {}, five_hour_cap),
+        ("weekly", limits.get("weekly") or {}, weekly_cap),
+    ):
+        cap = entry.get("cap") or fallback or 0
+        used = entry.get("used")
+        if entry.get("resetAt"):
+            # 0 means the window has not opened yet: nothing has been spent in it.
+            resets_at = entry["resetAt"] / 1000.0
+        else:
+            resets_at = None
+        windows.append(
+            {
+                "name": label,
+                "status": "exceeded" if entry.get("exceeded") else "ok",
+                "used": used,
+                "cap": cap or None,
+                "percent": (used / cap * 100) if used is not None and cap else 0.0,
+                "resetsAt": resets_at,
+            }
+        )
+
+    extra = (credits.get("purchasedCredits") or 0) + (credits.get("freeCredits") or 0)
+    state = subscription.get("status")
+    if not state:
+        state = "active" if pool else "unknown"
+    name = plan_id.replace("individual-", "").replace("team-", "team ").upper() if plan_id else None
+    return {
+        "active": state in ("active", "trialing"),
+        "state": state,
+        "plan": name,
+        "monthlyCredits": pool,
+        "windows": windows,
+        "balance": extra if extra else None,
+        "periodEnd": _iso_epoch_millis(subscription.get("currentPeriodEnd")),
+        "cancelAtPeriodEnd": subscription.get("cancelAtPeriodEnd"),
+        "source": url,
+    }
+
+
+# Providers with a real limits surface. Everything absent here has no public
+# route: they keep usage in a web UI and send no quota or credit headers on
+# inference responses, so nothing can be read from the API.
+LIMIT_ADAPTERS = {
+    "commandcode": _limits_commandcode,
+    "opencode-go": _limits_opencode,
+    "nano-gpt": _limits_nanogpt,
+    "zai": _limits_zai,
+}
+
+
+def load_state() -> dict:
+    try:
+        return json.loads(state_path().read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def save_state(state: dict) -> None:
+    try:
+        home().mkdir(parents=True, exist_ok=True)
+        write_json(state_path(), state)
+    except OSError:
+        pass
+
+
+# --------------------------------------------------------------------------
+# status helpers
+# --------------------------------------------------------------------------
+
+
+def sub_state(prov: Provider, state: dict, style: Style) -> str:
+    """Subscription status from the last --live run, with its age."""
+    cached = (state.get("limits") or {}).get(prov.name)
+    if prov.name not in LIMIT_ADAPTERS:
+        return style.dim("no api")
+    if not cached:
+        return style.dim("unknown")
+    data = cached.get("data") or {}
+    age = human_age(time.time() - (cached.get("fetchedAt") or 0))
+    state_name = (data.get("state") or "unknown").lower()
+    active = data.get("active")
+    if active is False or state_name in ("inactive", "past_due", "canceled"):
+        detail = data.get("providerStatus") or state_name
+        return style.yellow(f"inactive ({detail})")
+    if data.get("note"):
+        return style.dim("unknown")
+    if data.get("windows"):
+        peak = max((w.get("percent") or 0) for w in data["windows"])
+        return style.green(f"active, peak {peak:.0f}%") if peak < 90 else style.yellow(f"active, peak {peak:.0f}%")
+    if active is True:
+        return style.green(f"active ({age})")
+    return style.dim("unknown")
+
+
+def auth_state(prov: Provider, state: dict, style: Style) -> str:
+    if prov.auth_type == "oauth":
+        if prov.token_expiry:
+            remaining = prov.token_expiry - time.time()
+            if remaining <= 0:
+                return style.red(f"expired {human_duration(remaining)} ago")
+            return style.green(f"active, {human_duration(remaining)} left")
+        return "oauth (unknown expiry)"
+    if not prov.key:
+        return style.red("no key")
+    cached = (state.get("checks") or {}).get(prov.name) or {}
+    if cached.get("state") == "active":
+        age = time.time() - (cached.get("checkedAt") or 0)
+        return style.green(f"active ({human_age(age)})")
+    if cached.get("state") == "invalid":
+        return style.red("rejected")
+    return style.yellow("unverified")
+
+
+def limit_state(prov: Provider, live: dict | None) -> str:
+    """What the provider can actually tell us: quota windows, metered usage, or nothing."""
+    window = (live or {}).get("window") or {}
+    if window.get("from") and window.get("to"):
+        return f"usage {window['from']}..{window['to']}"
+    has_quota = prov.name in LIMIT_ADAPTERS
+    has_usage = prov.name in USAGE_ENDPOINTS
+    if has_quota and has_usage:
+        return "quota + usage api"
+    if has_quota:
+        return "quota api (plan only)" if prov.name == "zai" else "quota api"
+    if has_usage:
+        return "usage api"
+    return "none"
+
+
+def keyfile_candidates(cfg: Config, provider: str) -> list[Keyfile]:
+    return [k for k in cfg.keyfiles if k.provider == provider]
+
+
+def active_keyfile(cfg: Config, prov: Provider) -> Keyfile | None:
+    for keyfile in keyfile_candidates(cfg, prov.name):
+        if prov.key and keyfile.value == prov.key:
+            return keyfile
+    return None
+
+
+# --------------------------------------------------------------------------
+# commands
+# --------------------------------------------------------------------------
+
+
+def cmd_status(args, style: Style) -> int:
+    cfg = load_config()
+    providers = build_providers(cfg)
+    state = load_state()
+    month = args.month or current_month()
+    usage = scan_sessions(use_cache=not args.no_cache, quiet=args.quiet) if not args.no_usage else {}
+    month_totals = provider_month_totals(usage, month)
+
+    live: dict[str, dict] = {}
+    if args.live:
+        for prov in sorted(providers.values(), key=lambda p: p.name):
+            if not prov.key or prov.auth_type == "oauth":
+                continue
+            try:
+                live[prov.name] = live_usage(prov, month) or {}
+                state.setdefault("checks", {})[prov.name] = {
+                    "state": "active",
+                    "checkedAt": time.time(),
+                }
+            except PkeysError as exc:
+                live[prov.name] = {"error": exc.message}
+                state.setdefault("checks", {})[prov.name] = {
+                    "state": "invalid",
+                    "checkedAt": time.time(),
+                    "detail": exc.message,
+                }
+            if prov.name in LIMIT_ADAPTERS:
+                try:
+                    fetched = fetch_limits(prov)
+                    if fetched:
+                        state.setdefault("limits", {})[prov.name] = {
+                            "fetchedAt": time.time(),
+                            "data": fetched,
+                        }
+                except PkeysError as exc:
+                    state.setdefault("limits", {})[prov.name] = {
+                        "fetchedAt": time.time(),
+                        "data": {"state": "unknown", "note": exc.message},
+                    }
+        save_state(state)
+
+    rows = []
+    names = sorted(providers)
+    for name in names:
+        prov = providers[name]
+        totals = month_totals.get(name, {})
+        tokens = totals.get("totalTokens")
+        cost = totals.get("cost")
+        source = prov.key_source
+        if prov.has_conflict:
+            source += " " + style.yellow("(conflict)")
+        label = name
+        if name == cfg.default_provider and not args.plain:
+            label = style.bold(name) + style.dim(" *")
+        rows.append(
+            [
+                label,
+                auth_state(prov, state, style),
+                source,
+                str(len(prov.models)) if prov.models else "-",
+                sub_state(prov, state, style),
+                human_int(tokens),
+                human_money(cost),
+                limit_state(prov, live.get(name)),
+                prov.fingerprint,
+            ]
+        )
+
+    if args.json:
+        payload = {
+            "month": month,
+            "default": {"provider": cfg.default_provider, "model": cfg.default_model},
+            "providers": {
+                name: {
+                    "auth": _plain(auth_state(providers[name], state, Style(False))),
+                    "authType": providers[name].auth_type,
+                    "keySource": providers[name].key_source,
+                    "fingerprint": providers[name].fingerprint,
+                    "baseUrl": providers[name].base_url,
+                    "models": len(providers[name].models),
+                    "usage": month_totals.get(name, {}),
+                    "limits": limit_state(providers[name], live.get(name)),
+                    "live": live.get(name),
+                }
+                for name in names
+            },
+        }
+        print(json.dumps(payload, indent=2, sort_keys=True))
+        return EX_OK
+
+    if args.plain:
+        print("provider\tauth\tkey_source\tmodels\ttokens\tcost\tlimits\tfingerprint")
+        for row in rows:
+            print("\t".join(_plain(c) for c in row))
+    else:
+        headers = ["PROVIDER", "AUTH", "KEY SOURCE", "MODELS", "SUB", "TOKENS", "COST", "LIMITS", "KEY"]
+        print(render_table(headers, rows, style))
+        total_tokens = sum((month_totals.get(n, {}).get("totalTokens") or 0) for n in names)
+        total_cost = sum((month_totals.get(n, {}).get("cost") or 0) for n in names)
+        print()
+        print(
+            style.dim(
+                f"{month}: {human_int(total_tokens)} tokens, {human_money(total_cost)} recorded across "
+                f"{len(names)} providers"
+            )
+        )
+        if not args.live:
+            print(style.dim("SUB and provider limits are as of the last --live run. Nothing was fetched now."))
+        print()
+        print(style.dim("Next: pkeys limits    pkeys usage    pkeys models    pkeys doctor    pkeys rotate --provider <name>"))
+    return EX_OK
+
+
+def _plain(text: str) -> str:
+    return _strip_ansi(text)
+
+
+def cmd_usage(args, style: Style) -> int:
+    cfg = load_config()
+    providers = build_providers(cfg)
+    month = args.month or current_month()
+    usage = scan_sessions(use_cache=not args.no_cache, quiet=args.quiet)
+
+    by_provider = provider_month_totals(usage, month)
+    if args.provider:
+        if args.provider not in providers and args.provider not in by_provider:
+            raise PkeysError(
+                f"unknown provider '{args.provider}'",
+                EX_USAGE,
+                "Known providers: " + ", ".join(sorted(set(providers) | set(by_provider))),
+            )
+        selected = [args.provider]
+    else:
+        selected = sorted(set(by_provider) | set(providers))
+
+    live: dict[str, dict] = {}
+    if args.live:
+        for name in selected:
+            prov = providers.get(name)
+            if not prov or not prov.key:
+                continue
+            try:
+                reported = live_usage(prov, month)
+                if reported:
+                    live[name] = reported
+            except PkeysError as exc:
+                live[name] = {"error": exc.message}
+                note(f"{PROG}: warning: {name}: {exc.message}")
+
+    if args.json:
+        payload = {"month": month, "providers": {}, "live": live or None}
+        for name in selected:
+            totals = by_provider.get(name, {})
+            payload["providers"][name] = {
+                "totals": {k: v for k, v in totals.items() if k != "models"},
+                "models": totals.get("models", {}),
+            }
+        print(json.dumps(payload, indent=2, sort_keys=True))
+        return EX_OK
+
+    if args.plain:
+        # One record per line, header included, so awk/cut work without parsing prose.
+        print("provider\tmodel\ttokens\tshare\tinput\toutput\tcache_read\tcost")
+        for name in selected:
+            totals = by_provider.get(name, {})
+            token_total = totals.get("totalTokens") or 0
+            models = totals.get("models", {})
+            if not models:
+                print(f"{name}\t-\t0\t-\t0\t0\t0\t$0")
+                continue
+            for model, agg in sorted(models.items(), key=lambda kv: kv[1]["totalTokens"], reverse=True):
+                share = (agg["totalTokens"] / token_total * 100) if token_total else 0
+                print(
+                    "\t".join([
+                        name,
+                        model,
+                        str(agg["totalTokens"]),
+                        f"{share:.0f}%",
+                        str(agg["input"]),
+                        str(agg["output"]),
+                        str(agg["cacheRead"]),
+                        f"{agg['cost']:.6f}",
+                    ])
+                )
+        return EX_OK
+
+    any_rows = False
+    for name in selected:
+        totals = by_provider.get(name, {})
+        models = totals.get("models", {})
+        reported = live.get(name)
+        if not models and not reported:
+            if args.provider:
+                print(f"{name}: no recorded usage for {month}")
+                hint = ""
+                if name in providers and name not in USAGE_ENDPOINTS:
+                    hint = " (this provider does not expose metered usage either)"
+                print(style.dim(f"  switch to it, or pass --live{hint}"))
+            continue
+        any_rows = True
+        header = style.bold(name)
+        if name == cfg.default_provider:
+            header += style.dim(" (default)")
+        token_total = totals.get("totalTokens") or 0
+        print(f"{header}  {month}  {human_int(token_total)} tokens  {human_money(totals.get('cost'))}  {human_int(totals.get('requests'))} requests")
+        if models:
+            rows = []
+            for model, agg in sorted(models.items(), key=lambda kv: kv[1]["totalTokens"], reverse=True):
+                share = (agg["totalTokens"] / token_total * 100) if token_total else 0
+                rows.append(
+                    [
+                        model,
+                        human_int(agg["totalTokens"]),
+                        f"{share:.0f}%",
+                        human_int(agg["input"]),
+                        human_int(agg["output"]),
+                        human_int(agg["cacheRead"]),
+                        human_money(agg["cost"]),
+                    ]
+                )
+            if args.plain:
+                print("model\ttokens\tshare\tinput\toutput\tcache_read\tcost")
+                for row in rows:
+                    print("\t".join(row))
+            else:
+                print(render_table(
+                    ["MODEL", "TOKENS", "SHARE", "INPUT", "OUTPUT", "CACHE RD", "COST"],
+                    rows,
+                    style,
+                ))
+        if reported:
+            print()
+            window = reported.get("window") or {}
+            print(
+                style.dim(
+                    f"  provider-reported {window.get('from')}..{window.get('to')}: "
+                    f"{human_int(reported.get('requests'))} requests, "
+                    f"{human_int(reported.get('totalTokens'))} tokens, "
+                    f"{human_money(reported.get('cost'))}"
+                )
+            )
+            for entry in reported.get("models") or []:
+                print(
+                    style.dim(
+                        f"    {entry.get('model')}: {human_int(entry.get('tokens'))} tokens, "
+                        f"{human_int(entry.get('requests'))} requests"
+                    )
+                )
+        print()
+
+    if not any_rows:
+        print(f"No usage recorded for {month}.")
+        print(style.dim(f"Try another month: pkeys usage --month {_previous_month(month)}"))
+    return EX_OK
+
+
+def _previous_month(month: str) -> str:
+    try:
+        year, mon = month.split("-")
+        year_i, mon_i = int(year), int(mon)
+    except ValueError:
+        return current_month()
+    mon_i -= 1
+    if mon_i == 0:
+        year_i, mon_i = year_i - 1, 12
+    return f"{year_i:04d}-{mon_i:02d}"
+
+
+def bar(percent: float | None, width: int = 20) -> str:
+    """A bar that reads at a glance and still works without colour."""
+    if percent is None:
+        return " " * width + "   ?"
+    filled = int(round(max(0.0, min(100.0, percent)) / 100 * width))
+    marks = "#" * filled + "." * (width - filled)
+    suffix = f" {percent:>5.1f}%" if percent % 1 else f" {percent:>5.0f}%"
+    return marks + suffix
+
+
+def cmd_limits(args, style: Style) -> int:
+    cfg = load_config()
+    providers = build_providers(cfg)
+    state = load_state()
+    selected = [args.provider] if args.provider else sorted(providers)
+
+    if args.provider and args.provider not in providers:
+        close = difflib.get_close_matches(args.provider, list(providers), n=1)
+        hint = f"Did you mean '{close[0]}'?" if close else "Known providers: " + ", ".join(sorted(providers))
+        raise PkeysError(f"unknown provider '{args.provider}'", EX_USAGE, hint)
+
+    results = {}
+    failures = 0
+    if args.live:
+        for name in selected:
+            prov = providers[name]
+            if prov.name not in LIMIT_ADAPTERS or not prov.key:
+                results[name] = (state.get("limits") or {}).get(name, {}).get("data")
+                continue
+            try:
+                data = fetch_limits(prov)
+                state.setdefault("limits", {})[name] = {"fetchedAt": time.time(), "data": data}
+                results[name] = data
+            except PkeysError as exc:
+                results[name] = {"state": "unknown", "note": exc.message, "source": None}
+                failures += 1
+        save_state(state)
+    else:
+        for name in selected:
+            results[name] = (state.get("limits") or {}).get(name, {}).get("data")
+
+    if args.json:
+        payload = {}
+        for name in selected:
+            cached = (state.get("limits") or {}).get(name) or {}
+            payload[name] = {
+                "fetchedAt": cached.get("fetchedAt"),
+                "supportsApi": name in LIMIT_ADAPTERS,
+                "data": results.get(name),
+            }
+        print(json.dumps(payload, indent=2, sort_keys=True))
+        return EX_NETWORK if failures else EX_OK
+
+    if args.plain:
+        print("provider\tkind\tname\tpercent\tused\tlimit\tremaining\tresets_at\tbalance")
+        for name in selected:
+            data = results.get(name) or {}
+            balance = data.get("balance")
+            stamp = _iso(data.get("periodEnd"))
+            if data.get("windows"):
+                for window in data["windows"]:
+                    print("\t".join([
+                        name, "window", str(window.get("name")), f"{window.get('percent') or 0:.0f}",
+                        str(window.get("used") if window.get("used") is not None else ""),
+                        str(window.get("cap") if window.get("cap") is not None else ""),
+                        "", _iso(window.get("resetsAt")), balance or "",
+                    ]))
+            elif data.get("quotas"):
+                for quota in data["quotas"]:
+                    print("\t".join([
+                        name, "quota", str(quota.get("name")), f"{(quota.get('percent') or 0):.0f}",
+                        str(quota.get("used") if quota.get("used") is not None else ""),
+                        "", str(quota.get("remaining") if quota.get("remaining") is not None else ""),
+                        _iso(quota.get("resetsAt")), balance or "",
+                    ]))
+            else:
+                reason = data.get("note") or ("no api" if name not in LIMIT_ADAPTERS else "unknown")
+                print("\t".join([name, "none", reason, "", "", "", "", stamp, balance or ""]))
+        return EX_NETWORK if failures else EX_OK
+
+    if not args.live:
+        print(style.dim("Showing the last fetched values. Add --live to refresh from the providers."))
+        print()
+
+    for name in selected:
+        data = results.get(name)
+        cached = (state.get("limits") or {}).get(name) or {}
+        title = style.bold(name)
+        if name == cfg.default_provider:
+            title += style.dim(" (default)")
+        if name not in LIMIT_ADAPTERS:
+            print(f"{title}  {style.dim('no limits API')}")
+            print(style.dim("  no public route exposes plan or quota for this provider"))
+            print()
+            continue
+        if not data:
+            print(f"{title}  {style.dim('never fetched')}")
+            print(style.dim(f"  pkeys limits {name} --live"))
+            print()
+            continue
+
+        when = cached.get("fetchedAt")
+        print(f"{title}  {style.dim(human_age(time.time() - when) if when else 'unknown age')}")
+
+        if data.get("note"):
+            print(f"  status      {style.yellow(data['note'])}")
+        elif data.get("state"):
+            state_name = data["state"]
+            detail = data.get("providerStatus")
+            text = state_name + (f" ({detail})" if detail and detail != state_name else "")
+            coloured = style.green(text) if data.get("active") else style.yellow(text) if data.get("active") is False else text
+            print(f"  status      {coloured}")
+        if data.get("plan"):
+            print(f"  {'plan':<20}{data['plan']}")
+        for window in data.get("windows") or []:
+            window_name = str(window.get("name"))
+            status = window.get("status")
+            if status and status != "ok":
+                window_name += f" {style.red(status)}"
+            reset = window.get("resetsAt")
+            line = f"  {window_name:<14}{bar(window.get('percent'))}"
+            if window.get("used") is not None and window.get("cap"):
+                line += f"   {human_money(window['used'])} of {human_money(window['cap'])}"
+            if reset:
+                line += style.dim(f"   resets in {human_duration(reset - time.time())}")
+            print(line)
+        for quota in data.get("quotas") or []:
+            used = quota.get("used")
+            remaining = quota.get("remaining")
+            parts = [f"  {str(quota.get('name')):<20}{bar(quota.get('percent'))}"]
+            if used is not None and remaining is not None:
+                parts.append(f"{human_int(used)} used, {human_int(remaining)} left")
+            elif remaining is not None:
+                parts.append(f"{human_int(remaining)} allowance")
+            reset = quota.get("resetsAt")
+            if reset:
+                parts.append(f"resets in {human_duration(reset - time.time())}")
+            print("   ".join(parts))
+        if data.get("balance") is not None:
+            try:
+                print(f"  {'balance':<20}{human_money(float(data['balance']))} USD")
+            except (TypeError, ValueError):
+                print(f"  {'balance':<20}{data['balance']} USD")
+        routing = data.get("routing") or {}
+        if routing.get("recommendedMode"):
+            print(style.dim(f"  routing           {routing['recommendedMode']} — {routing.get('reason') or ''}"))
+        if data.get("source"):
+            print(style.dim(f"  source            {data['source']}"))
+        print()
+
+    return EX_NETWORK if failures else EX_OK
+
+
+def _iso(epoch_seconds: float | None) -> str:
+    if not epoch_seconds:
+        return ""
+    return datetime.fromtimestamp(epoch_seconds, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def cmd_models(args, style: Style) -> int:
+    cfg = load_config()
+    providers = build_providers(cfg)
+    month = args.month or current_month()
+    usage = (
+        scan_sessions(use_cache=not getattr(args, "no_cache", False), quiet=args.quiet)
+        if not args.no_usage
+        else {}
+    )
+    month_usage = model_month_usage(usage, month)
+
+    if args.provider:
+        if args.provider not in providers:
+            raise PkeysError(
+                f"unknown provider '{args.provider}'",
+                EX_USAGE,
+                "Known providers: " + ", ".join(sorted(providers)),
+            )
+        selected = [args.provider]
+    else:
+        selected = sorted(providers)
+
+    if args.json:
+        payload = {}
+        for name in selected:
+            prov = providers[name]
+            payload[name] = {
+                "baseUrl": prov.base_url,
+                "api": prov.api,
+                "models": [
+                    {
+                        "id": model.get("id"),
+                        "name": model.get("name"),
+                        "reasoning": model.get("reasoning"),
+                        "contextWindow": model.get("contextWindow"),
+                        "maxTokens": model.get("maxTokens"),
+                        "cost": model.get("cost"),
+                        "usage": month_usage.get((name, model.get("id"))),
+                    }
+                    for model in prov.models
+                ],
+            }
+        print(json.dumps({"month": month, "providers": payload}, indent=2, sort_keys=True))
+        return EX_OK
+
+    for name in selected:
+        prov = providers[name]
+        used = [(m, a) for (p, m), a in month_usage.items() if p == name]
+        used_total = sum(a["totalTokens"] for _, a in used)
+        title = style.bold(name)
+        if name == cfg.default_provider:
+            title += style.dim(" (default)")
+        print(f"{title}  {len(prov.models)} models  {human_int(used_total)} tokens in {month}")
+        if not prov.models:
+            print(style.dim("  no models configured in models.json or models-store.json"))
+            print()
+            continue
+        rows = []
+        for model in prov.models:
+            mid = model.get("id")
+            agg = month_usage.get((name, mid))
+            cost = model.get("cost") or {}
+            is_default = name == cfg.default_provider and mid == cfg.default_model
+            rows.append(
+                [
+                    (style.bold(mid) if is_default else mid),
+                    human_int(model.get("contextWindow")) if model.get("contextWindow") else "-",
+                    f"{cost.get('input', 0):g}/{cost.get('output', 0):g}",
+                    human_int(agg["totalTokens"]) if agg else "-",
+                    human_money(agg["cost"]) if agg else "-",
+                ]
+            )
+        if args.plain:
+            print("model\tcontext\tcost_in_out\ttokens\tcost")
+            for row in rows:
+                print("\t".join(_plain(c) for c in row))
+        else:
+            print(render_table(
+                ["MODEL", "CONTEXT", "IN/OUT $/Mtok", "TOKENS", "COST"],
+                rows,
+                style,
+            ))
+        print()
+    return EX_OK
+
+
+def cmd_doctor(args, style: Style) -> int:
+    root = agent_dir()
+    problems: list[tuple[str, str, str, str]] = []  # level, area, message, hint
+
+    for name in ("auth.json", "models.json", "settings.json", "models-store.json"):
+        path = root / name
+        if not path.exists():
+            if name in ("auth.json", "models.json"):
+                problems.append(("error", name, "missing", "pi writes this; run pi once"))
+            continue
+        try:
+            json.loads(path.read_text())
+        except json.JSONDecodeError as exc:
+            problems.append(
+                ("error", name, f"invalid JSON at line {exc.lineno} col {exc.colno}: {exc.msg}",
+                 f"restore a backup: ls {root}/{name}.bak-*")
+            )
+        except OSError as exc:
+            problems.append(("error", name, f"unreadable: {exc}", ""))
+
+    cfg = load_config()
+    providers = build_providers(cfg)
+
+    for name, prov in sorted(providers.items()):
+        if not prov.key and prov.auth_type != "oauth":
+            problems.append(("error", name, "no key configured", f"pkeys rotate --provider {name}"))
+        if prov.has_conflict:
+            others = ", ".join(source for source, _ in prov.other_key_sources)
+            problems.append(
+                (
+                    "warn",
+                    name,
+                    f"key defined twice with different values ({prov.key_source} wins, {others} differs)",
+                    "keep one source; stale duplicates cause confusing 401s",
+                )
+            )
+        if prov.auth_type == "oauth" and prov.token_expiry:
+            remaining = prov.token_expiry - time.time()
+            if remaining <= 0:
+                problems.append(
+                    ("warn", name, f"OAuth token expired {human_duration(remaining)} ago",
+                     "run pi and re-authenticate")
+                )
+            elif remaining < 86400:
+                problems.append(
+                    ("warn", name, f"OAuth token expires in {human_duration(remaining)}", "re-authenticate soon")
+                )
+        if not prov.base_url:
+            problems.append(("info", name, "no base URL on record", "add it to models.json if you use this provider"))
+
+    # key store hygiene
+    for keyfile in cfg.keyfiles:
+        mode = keyfile.path.stat().st_mode & 0o777
+        if mode & 0o077:
+            problems.append(
+                (
+                    "warn",
+                    keyfile.path.name,
+                    f"key file is readable by others (mode {mode:o})",
+                    f"chmod 600 {keyfile.path}",
+                )
+            )
+        if keyfile.provider not in providers:
+            problems.append(("info", keyfile.path.name, "provider not in config", "harmless, kept for rotation"))
+
+    for path in (root / "auth.json",):
+        if path.exists():
+            mode = path.stat().st_mode & 0o777
+            if mode & 0o077:
+                problems.append(
+                    ("warn", path.name, f"world/group readable (mode {mode:o})", f"chmod 600 {path}")
+                )
+
+    # models without usage ever recorded are suspicious only if they claim the default
+    if cfg.default_provider and cfg.default_provider not in providers:
+        problems.append(
+            ("error", "settings.json",
+             f"defaultProvider '{cfg.default_provider}' is not a configured provider",
+             "pkeys rotate --set-default --provider <name> --model <id>")
+        )
+    default_models = [m.get("id") for m in providers.get(cfg.default_provider, Provider("")).models]
+    if cfg.default_model and default_models and cfg.default_model not in default_models:
+        problems.append(
+            ("error", "settings.json",
+             f"defaultModel '{cfg.default_model}' is not defined under '{cfg.default_provider}'",
+             "pick one from: pkeys models --provider " + cfg.default_provider)
+        )
+
+    if args.json:
+        print(json.dumps(
+            {"problems": [
+                {"level": level, "area": area, "message": message, "hint": hint}
+                for level, area, message, hint in problems
+            ]},
+            indent=2,
+        ))
+        return EX_CONFIG if any(p[0] == "error" for p in problems) else EX_OK
+
+    if not problems:
+        print(style.green("ok") + " — config parses, every provider has a key, no conflicts")
+        return EX_OK
+
+    for level, area, message, hint in problems:
+        tag = {
+            "error": style.red("error"),
+            "warn": style.yellow("warn "),
+            "info": style.dim("info "),
+        }[level]
+        print(f"{tag}  {area}: {message}")
+        if hint:
+            print(f"       {style.dim(hint)}")
+
+    errors = sum(1 for p in problems if p[0] == "error")
+    warns = sum(1 for p in problems if p[0] == "warn")
+    print()
+    print(style.dim(f"{errors} error(s), {warns} warning(s), {len(problems) - errors - warns} note(s)"))
+    return EX_CONFIG if errors else EX_OK
+
+
+def cmd_rotate(args, style: Style) -> int:
+    cfg = load_config()
+    providers = build_providers(cfg)
+    provider = args.provider
+    if not provider:
+        raise PkeysError(
+            "no provider given",
+            EX_USAGE,
+            "pkeys rotate --provider commandcode --dry-run   (add --apply to write)",
+        )
+    if provider not in providers:
+        close = difflib.get_close_matches(provider, list(providers), n=1)
+        hint = f"Did you mean '{close[0]}'?" if close else "Known providers: " + ", ".join(sorted(providers))
+        raise PkeysError(f"unknown provider '{provider}'", EX_USAGE, hint)
+
+    prov = providers[provider]
+    candidates = keyfile_candidates(cfg, provider)
+    active = active_keyfile(cfg, prov)
+
+    if args.list:
+        print(f"{provider}: {len(candidates)} key(s) in {home()}")
+        for keyfile in candidates:
+            marker = style.green("* ") if active and keyfile.path == active.path else "  "
+            print(f"{marker}{keyfile.path.name}  {fingerprint(keyfile.value)}")
+        if not candidates:
+            print(style.dim(f"  none — add one as {provider}-<label>.md"))
+        elif active is None:
+            print(style.dim(f"  live key {prov.fingerprint} is not in the store, so no row is starred"))
+        return EX_OK
+
+    if not candidates:
+        raise PkeysError(
+            f"no rotation keys for '{provider}' in {home()}",
+            EX_CONFIG,
+            f"Add one: printf '%s' '<key>' > {home()}/{provider}-<label>.md && chmod 600 it",
+        )
+
+    if args.key_file:
+        target = home() / args.key_file
+        if not target.exists():
+            target = Path(args.key_file)
+        if not target.exists():
+            raise PkeysError(f"key file not found: {args.key_file}", EX_USAGE)
+        chosen = next((k for k in candidates if k.path == target), None)
+        if not chosen:
+            value = target.read_text().strip()
+            chosen = Keyfile(path=target, provider=provider, label=target.stem, value=value)
+    else:
+        # round-robin: next candidate after the active one, wrapping
+        order = candidates
+        if active is not None:
+            index = order.index(active) if active in order else -1
+            chosen = order[(index + 1) % len(order)]
+        else:
+            chosen = order[0]
+
+    if prov.key == chosen.value:
+        print(f"{provider} already uses {chosen.path.name} ({fingerprint(chosen.value)}).")
+        print(style.dim("Nothing to rotate."))
+        return EX_OK
+
+    print(f"provider   {provider}")
+    print(f"current    {prov.key_source}  {fingerprint(prov.key)}")
+    if active is None:
+        print(style.yellow("note       live key is not in the key store; it cannot be selected again"))
+    print(f"next       {chosen.path.name}  {fingerprint(chosen.value)}")
+    if prov.has_conflict:
+        print(style.yellow("warning    provider key is duplicated across config files; both will be updated"))
+    if args.apply:
+        pass
+    else:
+        print()
+        print(style.dim("Dry run. Nothing written."))
+        print(style.dim(f"Apply with: pkeys rotate --provider {provider}" + (f" --key-file {chosen.path.name}" if args.key_file else "") + " --apply"))
+        return EX_OK
+
+    # --- apply ---
+    root = agent_dir()
+    stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    backups = []
+    for filename in ("auth.json", "models.json"):
+        path = root / filename
+        if not path.exists():
+            continue
+        backup = root / f"{filename}.bak-pkeys-{stamp}"
+        shutil.copy2(path, backup)
+        backups.append(backup)
+
+    changed = []
+    auth = read_json(root / "auth.json", required=True)
+    if isinstance(auth.get(provider), dict):
+        auth[provider]["key"] = chosen.value
+        changed.append(f"auth.json[{provider}].key")
+    if isinstance((auth.get("providers") or {}).get(provider), dict):
+        auth["providers"][provider]["apiKey"] = chosen.value
+        changed.append(f"auth.json[providers.{provider}].apiKey")
+    if "auth.json" in " ".join(changed):
+        write_json(root / "auth.json", auth)
+
+    models_doc = read_json(root / "models.json")
+    if isinstance((models_doc.get("providers") or {}).get(provider), dict):
+        models_doc["providers"][provider]["apiKey"] = chosen.value
+        changed.append(f"models.json[providers.{provider}].apiKey")
+        write_json(root / "models.json", models_doc)
+
+    if not changed:
+        raise PkeysError(
+            f"'{provider}' has no writable key slot in auth.json or models.json",
+            EX_CONFIG,
+            "Add the provider to models.json first, or rotate the source file by hand.",
+        )
+
+    entry = {
+        "at": datetime.now(timezone.utc).isoformat(),
+        "provider": provider,
+        "from": prov.fingerprint,
+        "to": fingerprint(chosen.value),
+        "keyFile": chosen.path.name,
+        "changed": changed,
+        "reason": args.reason or "manual",
+        "backups": [str(b) for b in backups],
+    }
+    with rotation_log_path().open("a") as handle:
+        handle.write(json.dumps(entry) + "\n")
+    os.chmod(rotation_log_path(), 0o600)
+
+    state = load_state()
+    state.setdefault("checks", {}).pop(provider, None)
+    state.setdefault("rotation", {})[provider] = {
+        "active": chosen.path.name,
+        "at": entry["at"],
+    }
+    save_state(state)
+
+    print()
+    for line in changed:
+        print(style.green("updated") + f"  {line}")
+    print(style.dim(f"backups  {', '.join(b.name for b in backups)}"))
+    print(style.dim(f"logged   {rotation_log_path()}"))
+    print()
+    print(style.dim("Verify with: pkeys status --live"))
+    return EX_OK
+
+
+def cmd_check(args, style: Style) -> int:
+    cfg = load_config()
+    providers = build_providers(cfg)
+    state = load_state()
+    names = [args.provider] if args.provider else sorted(providers)
+    failures = 0
+    results = []
+
+    for name in names:
+        prov = providers.get(name)
+        if not prov:
+            raise PkeysError(f"unknown provider '{name}'", EX_USAGE,
+                             "Known providers: " + ", ".join(sorted(providers)))
+        try:
+            result = live_validate(prov)
+            if result.get("state") in ("invalid", "expired", "no-key"):
+                failures += 1
+        except PkeysError as exc:
+            result = {"state": "invalid", "detail": exc.message}
+            failures += 1
+        result["checkedAt"] = time.time()
+        state.setdefault("checks", {})[name] = result
+        results.append((name, result))
+        if not args.json:
+            icon = {
+                "active": style.green("ok"),
+                "no-key": style.red("no key"),
+                "invalid": style.red("failed"),
+                "expired": style.red("expired"),
+                "oauth": style.yellow("oauth"),
+                "unknown": style.yellow("unknown"),
+            }.get(result.get("state"), "-")
+            detail = result.get("detail") or (
+                f"{result.get('models')} models visible" if result.get("models") is not None else ""
+            )
+            print(f"{icon:14} {name:16} {detail}")
+
+    save_state(state)
+    if args.json:
+        print(json.dumps({name: result for name, result in results}, indent=2, sort_keys=True))
+    return EX_NETWORK if failures else EX_OK
+
+
+# --------------------------------------------------------------------------
+# help
+# --------------------------------------------------------------------------
+
+
+LONG_HELP = f"""pkeys — provider key and usage dashboard
+
+Usage:
+  pkeys [status] [flags]          what every provider is, and what it is costing
+  pkeys limits [provider] [flags]  subscription state, quota windows, balance
+  pkeys models [provider] [flags] configured models, prices, and their usage
+  pkeys doctor [flags]            config health: bad JSON, duplicate keys, expired tokens
+  pkeys check [provider] --live   validate keys against the provider
+  pkeys rotate --provider <name>  rotate a key (dry run unless --apply)
+  pkeys help [command]            this text, or help for one command
+
+Common flags:
+  --json            machine-readable output on stdout
+  --plain           one record per line, tab separated, no padding or colour
+  --no-color        never colourise (also honours NO_COLOR)
+  --month YYYY-MM   month to report (default: current UTC month)
+  -q, --quiet       suppress progress messages on stderr
+  -h, --help        show help; adding -h to any command works
+
+Examples:
+  pkeys
+      One table: auth state, key source, monthly tokens and cost per provider.
+
+  pkeys limits --live
+      Refresh subscription state and quota windows from each provider.
+
+  pkeys usage --month {_previous_month(current_month())}
+      Where last month's tokens went, broken down by model.
+
+  pkeys usage nano-gpt --live
+      Ask the provider for its own metered usage and compare with local logs.
+
+  pkeys rotate --provider commandcode
+      Preview swapping to the next key in {home()}. Writes nothing.
+
+  pkeys rotate --provider commandcode --apply
+      Perform that swap. Backs up both config files and logs the change.
+
+  pkeys doctor
+      Run this first when something 401s.
+
+Notes:
+  Nothing is fetched from the network unless you pass --live.
+  Local usage is read from {sessions_dir()}.
+  Keys are shown only as an 8-character SHA-256 fingerprint, never in full.
+"""
+
+COMMAND_SUMMARY = [
+    ("status", "overview: auth, subscription, tokens, cost per provider"),
+    ("limits", "subscription state, quota windows and balance, per provider"),
+    ("usage", "tokens per provider and model for a month"),
+    ("models", "configured models, prices, and usage"),
+    ("doctor", "config health checks"),
+    ("check", "validate keys against providers (--live)"),
+    ("rotate", "swap to another key from the key store"),
+    ("help", "help for pkeys or a command"),
+]
+
+COMMAND_HELP = {
+    "status": """pkeys status — one line per provider
+
+Usage: pkeys [status] [--month YYYY-MM] [--live] [--json|--plain] [--no-usage]
+
+Shows auth state (active/unverified/expired), where the key comes from, model
+count, tokens and cost for the month, and whether the provider exposes limits.
+
+--live      also ask each provider for its metered usage (network)
+--no-usage  skip the session-log scan; config-only, instant
+""",
+    "limits": """pkeys limits — subscription state, quotas, balance
+
+Usage: pkeys limits [provider] [--live] [--json|--plain]
+
+Reads each provider's own limits endpoint:
+  opencode-go  GET /inference/go/v1/usage — rolling 5h, weekly, monthly percent
+  nano-gpt     GET /api/v1/subscription/usage and POST /api/check-balance
+  zai          GET /api/monitor/usage/quota/limit (GLM Coding Plan only)
+
+Without --live this prints the values from the last fetch, with their age.
+Providers with no public limits route are marked 'no api' rather than guessed at.
+
+Exit code is 4 if a refresh failed.
+""",
+    "usage": """pkeys usage — tokens per provider and model
+
+Usage: pkeys usage [provider] [--month YYYY-MM] [--live] [--json|--plain]
+
+Reads assistant usage records from pi session logs. Costs come from the
+per-model prices recorded in those logs.
+
+--live      ask the provider for its own metered usage (nano-gpt supports this)
+--month     YYYY-MM, default current UTC month
+--no-cache  ignore the incremental parse cache
+""",
+    "models": """pkeys models — configured models
+
+Usage: pkeys models [provider] [--month YYYY-MM] [--json|--plain]
+
+Lists each model with context window, input/output price per million tokens,
+and this month's recorded tokens and cost. The default model is bolded.
+""",
+    "doctor": """pkeys doctor — config health
+
+Usage: pkeys doctor [--json]
+
+Checks JSON validity of auth.json, models.json, settings.json and the model
+store; providers without keys; the same key defined twice with different
+values; expired OAuth tokens; key-file permissions; and whether the default
+model actually exists under the default provider.
+
+Exit code is 3 when it finds an error, so scripts can gate on it.
+""",
+    "check": """pkeys check — validate keys
+
+Usage: pkeys check [provider] --live
+
+Makes the cheapest authenticated call a provider offers (usually GET /models)
+and records the result in the state cache so 'pkeys status' can show it.
+
+Exit code is 4 if any key is rejected.
+""",
+    "rotate": """pkeys rotate — swap keys from the key store
+
+Usage:
+  pkeys rotate --provider <name> [--dry-run]
+  pkeys rotate --provider <name> --apply [--key-file <file>] [--reason TEXT]
+  pkeys rotate --provider <name> --list
+
+Keys live in {home}, named <provider>-<label>.md, one key per file.
+Without --key-file, rotation picks the next file after the active key,
+wrapping around (round-robin).
+
+Default is a dry run: prints the planned swap and writes nothing.
+With --apply it backs up auth.json and models.json to
+<file>.bak-pkeys-<timestamp>, writes the new key into every slot that holds
+the old one, clears the cached validation result, and appends a line to
+{rotation_log_path}.
+""",
+}
+
+
+def print_help(command: str | None = None) -> int:
+    if command and command in COMMAND_HELP:
+        print(COMMAND_HELP[command].format(home=home(), rotation_log_path=rotation_log_path()))
+        return EX_OK
+    if command:
+        close = difflib.get_close_matches(command, list(COMMAND_HELP), n=1)
+        hint = f"Did you mean 'pkeys help {close[0]}'?" if close else ""
+        raise PkeysError(f"no help for '{command}'", EX_USAGE, hint or "pkeys help")
+    commands = "\n".join(f"  {name:<8}{summary}" for name, summary in COMMAND_SUMMARY)
+    print(LONG_HELP)
+    print("Commands:")
+    print(commands)
+    return EX_OK
+
+
+# --------------------------------------------------------------------------
+# cli
+# --------------------------------------------------------------------------
+
+
+class Parser(argparse.ArgumentParser):
+    """argparse, but errors are one line plus a hint instead of a wall of usage."""
+
+    def error(self, message: str):
+        commands = [name for name, _ in COMMAND_SUMMARY]
+        hint = None
+        if "invalid choice" in message:
+            for token in message.split("'"):
+                close = difflib.get_close_matches(token, commands, n=1)
+                if close and token not in commands:
+                    hint = f"Did you mean 'pkeys {close[0]}'?"
+                    break
+        if hint is None:
+            hint = "Run 'pkeys help' for usage."
+        raise PkeysError(message, EX_USAGE, hint)
+
+
+def build_parser() -> Parser:
+    parser = Parser(prog=PROG, add_help=False, description="provider key and usage dashboard")
+    parser.add_argument("--json", action="store_true", help="machine-readable output")
+    parser.add_argument("--plain", action="store_true", help="one record per line, tab separated")
+    parser.add_argument("--no-color", action="store_true", help="disable colour")
+    parser.add_argument("--month", default=None, help="month to report, YYYY-MM")
+    parser.add_argument("-q", "--quiet", action="store_true", help="suppress progress output")
+    parser.add_argument("-h", "--help", action="store_true", help="show help")
+    parser.add_argument("--version", action="store_true", help="show version")
+
+    sub = parser.add_subparsers(dest="command", parser_class=Parser)
+
+    def add(name: str) -> Parser:
+        child = sub.add_parser(name, add_help=False)
+        child.add_argument("--json", action="store_true")
+        child.add_argument("--plain", action="store_true")
+        child.add_argument("--no-color", action="store_true")
+        child.add_argument("--month", default=None)
+        child.add_argument("-q", "--quiet", action="store_true")
+        child.add_argument("-h", "--help", action="store_true")
+        child.add_argument("--live", action="store_true")
+        return child
+
+    status = add("status")
+    status.add_argument("--no-usage", action="store_true", help="skip the session-log scan")
+    status.add_argument("--no-cache", action="store_true", help="ignore the parse cache")
+
+    usage = add("usage")
+    usage.add_argument("provider", nargs="?")
+    usage.add_argument("--no-cache", action="store_true")
+
+    models = add("models")
+    models.add_argument("provider", nargs="?")
+    models.add_argument("--no-usage", action="store_true")
+
+    add("doctor")
+
+    check = add("check")
+    check.add_argument("provider", nargs="?")
+
+    limits = add("limits")
+    limits.add_argument("provider", nargs="?")
+
+    rotate = add("rotate")
+    rotate.add_argument("--provider")
+    rotate.add_argument("--key-file")
+    rotate.add_argument("--apply", action="store_true")
+    rotate.add_argument("--dry-run", action="store_true")
+    rotate.add_argument("--list", action="store_true")
+    rotate.add_argument("--reason")
+
+    help_cmd = add("help")
+    help_cmd.add_argument("topic", nargs="?")
+
+    return parser
+
+
+COMMANDS = {
+    "status": cmd_status,
+    "usage": cmd_usage,
+    "limits": cmd_limits,
+    "models": cmd_models,
+    "doctor": cmd_doctor,
+    "check": cmd_check,
+    "rotate": cmd_rotate,
+}
+
+
+def main(argv: list[str]) -> int:
+    parser = build_parser()
+
+    if not argv:
+        # No arguments still means "show me the dashboard"; -h gives the help text.
+        argv = ["status"]
+
+    if argv in (["-h"], ["--help"], ["help"]):
+        return print_help(None)
+    if argv[0] == "help":
+        return print_help(argv[1] if len(argv) > 1 else None)
+    if "--version" in argv:
+        print(f"{PROG} {VERSION}")
+        return EX_OK
+    # `-h` anywhere means help, even trailing.
+    if "-h" in argv or "--help" in argv:
+        command = argv[0] if argv[0] in COMMAND_HELP else None
+        return print_help(command)
+
+    args = parser.parse_args(argv)
+    if getattr(args, "command", None) is None:
+        args.command = "status"
+        # bare invocation with only global flags
+        for attribute in ("json", "plain", "no_color", "month", "quiet"):
+            if not hasattr(args, attribute):
+                setattr(args, attribute, getattr(parser.parse_args([]), attribute, None))
+        args.no_usage = False
+        args.no_cache = False
+
+    if getattr(args, "live", None) is None:
+        args.live = False
+
+    command = args.command
+    handler = COMMANDS.get(command)
+    if handler is None:
+        raise PkeysError(f"unknown command '{command}'", EX_USAGE, "Run 'pkeys help'.")
+
+    style = Style(color_enabled(getattr(args, "no_color", False)))
+    if getattr(args, "plain", False):
+        style = Style(False)
+    return handler(args, style)
+
+
+def entrypoint() -> None:
+    try:
+        code = main(sys.argv[1:])
+    except PkeysError as exc:
+        error(exc.message, exc.hint)
+        code = exc.code
+    except KeyboardInterrupt:
+        note(f"{PROG}: interrupted")
+        code = 130
+    except BrokenPipeError:
+        code = EX_OK
+    sys.exit(code)
+
+
+if __name__ == "__main__":
+    entrypoint()
